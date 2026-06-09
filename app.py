@@ -645,7 +645,7 @@ init();
 </html>
 '''
 
-VERSION = "2.6"
+VERSION = "2.7"
 STATE = {"running": False, "current": 0, "total": 0, "lines": [], "done": False, "date": ""}
 
 def hexrgb(h):
@@ -1166,11 +1166,54 @@ def _vs_login_worker():
     finally:
         VSCHART_STATE["login_running"] = False
 
-def verify_flatline(handle, video_id):
+def wayback_history(video_id, current_views):
+    """웹아카이브(Wayback)에서 과거 시점 조회수를 실측 → 수개월 성장률로 누움 판정.
+    차트 스크린샷·로그인 불필요. 100만+ 바이럴 영상은 스냅샷이 있는 경우가 많다."""
+    import urllib.request
+    def cdx_snaps(url_form):
+        try:
+            cdx = ("http://web.archive.org/cdx/search/cdx?url=" + url_form +
+                   "&output=json&filter=statuscode:200&limit=30")
+            rows = json.loads(urllib.request.urlopen(urllib.request.Request(cdx,
+                headers={"User-Agent": "shorts-editor"}), timeout=25).read() or b"[]")
+            return [r[1] for r in rows[1:]]
+        except Exception:
+            return []
+    snaps = cdx_snaps(f"youtube.com/shorts/{video_id}") or cdx_snaps(f"youtube.com/watch%3Fv%3D{video_id}")
+    if not snaps or not current_views: return None
+    today = datetime.date.today()
+    def ts_date(ts): return datetime.date(int(ts[:4]), int(ts[4:6]), int(ts[6:8]))
+    old = [t for t in snaps if (today - ts_date(t)).days >= 90]
+    if not old: return None
+    ts = max(old)  # 90일 이상 지난 것 중 가장 최근 스냅샷
+    try:
+        url = f"http://web.archive.org/web/{ts}/https://www.youtube.com/shorts/{video_id}"
+        html_txt = urllib.request.urlopen(urllib.request.Request(url,
+            headers={"User-Agent": "shorts-editor"}), timeout=90).read().decode("utf-8", "ignore")
+        m = re.search(r'"viewCount":"(\d+)"', html_txt)
+        if not m: return None
+        past = int(m.group(1))
+    except Exception:
+        return None
+    days = (today - ts_date(ts)).days
+    months = days / 30.4
+    growth = (current_views - past) / past if past else 0.0
+    monthly = growth / months if months else 0.0
+    flat = monthly < 0.01  # 월평균 성장 1% 미만 = 누움(시체)
+    return {"ok": True, "wayback": True, "snapshot_date": f"{ts[:4]}-{ts[4:6]}-{ts[6:8]}",
+            "past_views": past, "current_views": current_views, "days": days,
+            "growth_pct": round(growth*100, 1), "monthly_pct": round(monthly*100, 2),
+            "verdict": {"flat": flat, "months_flat": round(months, 1) if flat else 0, "confidence": 0.95,
+                        "reason": f"웹아카이브 실측: {ts[:4]}.{ts[4:6]} {past:,}회 → 현재 {current_views:,}회 (+{growth*100:.1f}%, 월 {monthly*100:.2f}%)"}}
+
+def verify_flatline(handle, video_id, current_views=0):
+    # 1차: 웹아카이브 실측 (무료·로그인 불필요·수개월 이력) → 실패 시 ViewStats 차트로 폴백
+    wb = wayback_history(video_id, int(current_views or 0))
+    if wb: return wb
     try:
         from playwright.sync_api import sync_playwright
     except Exception:
-        return {"ok": False, "msg": "Playwright 미설치 — 터미널에서: pip install playwright && playwright install chromium"}
+        return {"ok": False, "msg": "웹아카이브에 이 영상 기록이 없고, Playwright 미설치 — 터미널에서: pip install playwright && playwright install chromium"}
     if not handle or not video_id:
         return {"ok": False, "msg": "handle/video_id 필요"}
     url = f"https://www.viewstats.com/@{handle}/videos/{video_id}"
@@ -1301,7 +1344,7 @@ function card(v,rank){
    <div class="m"><div class="t"><a href="${yt}" target="_blank">${(v.title||'').slice(0,70)}</a></div>
    <div class="s"><span class="ch">@${v.handle}</span> · 👁${nf(v.current_views)} ${age} ${flat} ${v.used?'<span class="usedtag">✓ 사용함</span>':''}</div>
    <div class="act"><a class="btn ghost sm" href="${yt}" target="_blank">유튜브</a>
-   <button class="btn ghost sm flat" data-handle="${v.handle||''}" data-id="${id}">📊 누움검증</button>
+   <button class="btn ghost sm flat" data-handle="${v.handle||''}" data-id="${id}" data-views="${v.current_views||0}">📊 누움검증</button>
    <button class="btn ghost sm meta" data-title="${(v.title||'').replace(/"/g,'&quot;').slice(0,140)}">📋 제목·태그</button>
    <button class="btn ghost sm make" data-url="${yt}">⬇ 다운만</button>
    <button class="btn sm one" data-url="${yt}" data-title="${(v.title||'').replace(/"/g,'&quot;').slice(0,140)}">⚡ 원클릭</button></div></div></div>`;
@@ -1318,9 +1361,13 @@ function bind(){
   });
   document.querySelectorAll('.flat').forEach(b=>b.onclick=async()=>{
     const o=b.textContent; b.textContent='📊 차트 분석 중…'; b.disabled=true;
-    const r=await fetch('/api/verify_flatline',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({handle:b.dataset.handle,id:b.dataset.id})}).then(r=>r.json());
+    const r=await fetch('/api/verify_flatline',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({handle:b.dataset.handle,id:b.dataset.id,views:Number(b.dataset.views||0)})}).then(r=>r.json());
     b.disabled=false; b.textContent=o;
     if(!r.ok){ showMeta(r.msg||'실패','⚠ 누움검증 실패'); return; }
+    if(r.wayback){ const v=r.verdict||{};
+      showMeta(`${v.flat?'💀 누움(시체) 판정 — 재업로드 안전권':'📈 아직 성장 중 — 도굴 보류 권장'}\n\n웹아카이브 ${r.snapshot_date} 시점: ${nf(r.past_views)}회\n현재: ${nf(r.current_views)}회\n${r.days}일간 +${r.growth_pct}% (월평균 ${r.monthly_pct}%)\n\n판정 기준: 월평균 성장률 1% 미만 = 누움`,
+        v.flat?'💀 누움 검증 — 웹아카이브 실측':'📈 누움 검증 — 웹아카이브 실측');
+      b.textContent = v.flat?'💀 누움 확인':'📈 성장 중'; return; }
     if(r.need_login){ showChart(r.img,'⚠ 차트가 로그인 게이트입니다 — 상단 "📊 ViewStats 로그인"을 먼저 하세요.',r.url,'📊 로그인 필요'); return; }
     let vh='';
     if(r.verdict_error){ vh='⚠ AI 판정 실패: '+r.verdict_error+' (차트는 눈으로 확인하세요)'; }
@@ -1564,7 +1611,7 @@ class H(BaseHTTPRequestHandler):
         if self.path == "/api/verify_flatline":
             n = int(self.headers.get("Content-Length", 0))
             data = json.loads(self.rfile.read(n) or b"{}")
-            return self._send(200, json.dumps(verify_flatline(data.get("handle", ""), data.get("id", ""))))
+            return self._send(200, json.dumps(verify_flatline(data.get("handle", ""), data.get("id", ""), data.get("views", 0))))
         if self.path == "/api/vschart_login":
             if not VSCHART_STATE["login_running"]:
                 threading.Thread(target=_vs_login_worker, daemon=True).start()
