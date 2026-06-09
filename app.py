@@ -28,7 +28,7 @@ RUN_DIR = os.path.dirname(sys.executable) if FROZEN else os.path.dirname(os.path
 BUNDLE  = getattr(sys, "_MEIPASS", RUN_DIR)  # exe 내부 임시폴더(빌드시 동봉한 ffmpeg/폰트)
 
 def find_ffmpeg():
-    names = ["ffmpeg.exe", "ffmpeg"]
+    names = ["ffmpeg.exe", "ffmpeg"] if sys.platform == "win32" else ["ffmpeg"]
     for d in [BUNDLE, RUN_DIR, os.path.join(RUN_DIR, "_bin_win")]:
         for n in names:
             p = os.path.join(d, n)
@@ -643,7 +643,7 @@ init();
 </html>
 '''
 
-VERSION = "2.1"
+VERSION = "2.2"
 STATE = {"running": False, "current": 0, "total": 0, "lines": [], "done": False, "date": ""}
 
 def hexrgb(h):
@@ -707,7 +707,7 @@ def build_vf(opts, spd, tpl_win=None):
     if opts.get("zoom_on", True) and z > 1.0:
         fx = min(1.0, max(0.0, float(opts.get("zx", 0.5))))
         fy = min(1.0, max(0.0, float(opts.get("zy", 0.5))))
-        fl.append(f"scale=iw*{z}:ih*{z}")
+        fl.append(f"scale=1080*{z}:1920*{z}:force_original_aspect_ratio=increase")
         fl.append(f"crop=1080:1920:(in_w-1080)*{fx}:(in_h-1920)*{fy}")
     if opts.get("hdr", True): fl.append("eq=saturation=1.35:contrast=1.12:brightness=0.02")
     if opts.get("sharp", True): fl.append("unsharp=5:5:0.8")
@@ -775,11 +775,14 @@ def edit_one(src, dst, cap_png, bgm, opts, tpl_path=None, start=None, seg=None, 
     r = subprocess.run(cmd, capture_output=True, text=True)
     return r.returncode == 0
 
-def run_job(date, channel, bgm_name, opts):
+def run_job(date, channel, bgm_name, opts, only=None):
     try:
         src_dir = os.path.join(SRC_ROOT, date)
         out_dir = os.path.join(OUT_ROOT, date); os.makedirs(out_dir, exist_ok=True)
         vids = sorted(glob.glob(os.path.join(src_dir, "*.mp4")))
+        if only:
+            picked = [v for v in vids if os.path.basename(v) == only]
+            if picked: vids = picked
         bgm = None
         if bgm_name and not bgm_name.startswith("("):
             bgm = os.path.join(BGM_DIR, bgm_name)
@@ -909,8 +912,9 @@ CREATE TABLE IF NOT EXISTS snapshots(youtube_id TEXT, ts TEXT, views INTEGER);
 """
 
 def find_ytdlp():
+    names = ["yt-dlp.exe", "yt-dlp"] if sys.platform == "win32" else ["yt-dlp"]
     for d in [BUNDLE, RUN_DIR, os.path.join(RUN_DIR, "_bin_win")]:
-        for n in ["yt-dlp.exe", "yt-dlp"]:
+        for n in names:
             p = os.path.join(d, n)
             if os.path.exists(p): return p
     return "yt-dlp"
@@ -1001,14 +1005,30 @@ def digg_data(category="", min_views=1000000, age=120):
 
 def digg_grab(url):
     if not url: return {"ok": False, "msg": "URL 없음"}
+    m = re.search(r"(?:shorts/|watch\?v=|v=|youtu\.be/|/)([A-Za-z0-9_-]{11})(?:[?&/]|$)", url)
+    vid_id = m.group(1) if m else None
     day = datetime.date.today().strftime("%y%m%d")
     folder = os.path.join(SRC_ROOT, day); os.makedirs(folder, exist_ok=True)
     out = os.path.join(folder, "%(id)s.%(ext)s")
     try:
-        subprocess.run([YTDLP,"-f","bestvideo[height<=1080]+bestaudio/best","--merge-output-format","mp4","-o",out,"--no-warnings",url], timeout=300)
-        return {"ok": True, "date": day}
+        fmt = "bestvideo[height<=1080][vcodec^=avc1]+bestaudio[acodec^=mp4a]/bestvideo[height<=1080][vcodec^=avc1]+bestaudio/best[height<=1080][vcodec^=avc1]/bestvideo[height<=1080]+bestaudio/best"
+        subprocess.run([YTDLP,"-f",fmt,"--merge-output-format","mp4","-o",out,"--no-warnings",url], timeout=300)
+        fname = f"{vid_id}.mp4" if vid_id and os.path.exists(os.path.join(folder, f"{vid_id}.mp4")) else None
+        if not fname:
+            mp4s = sorted(glob.glob(os.path.join(folder, "*.mp4")), key=os.path.getmtime)
+            fname = os.path.basename(mp4s[-1]) if mp4s else None
+        if not fname: return {"ok": False, "msg": "다운로드 파일을 찾을 수 없음"}
+        return {"ok": True, "date": day, "file": fname}
     except Exception as e:
         return {"ok": False, "msg": str(e)}
+
+def digg_oneclick(url):
+    g = digg_grab(url)
+    if not g.get("ok"): return g
+    if STATE.get("running"):
+        return {"ok": False, "msg": "편집 작업이 이미 진행 중입니다", "date": g["date"]}
+    threading.Thread(target=run_job, args=(g["date"], channel_name(), "(원본 소리 사용)", {}), kwargs={"only": g["file"]}, daemon=True).start()
+    return {"ok": True, "date": g["date"], "file": g["file"]}
 
 DIGG_HTML = r'''<!DOCTYPE html>
 <html lang="ko"><head><meta charset="UTF-8">
@@ -1073,14 +1093,31 @@ function card(v,rank){
    <div class="m"><div class="t"><a href="${yt}" target="_blank">${(v.title||'').slice(0,70)}</a></div>
    <div class="s"><span class="ch">@${v.handle}</span> · 👁${nf(v.current_views)} ${age} ${flat}</div>
    <div class="act"><a class="btn ghost sm" href="${yt}" target="_blank">유튜브</a>
-   <button class="btn sm make" data-url="${yt}">🎬 가져와 편집</button></div></div></div>`;
+   <button class="btn ghost sm make" data-url="${yt}">⬇ 다운만</button>
+   <button class="btn sm one" data-url="${yt}">⚡ 원클릭 양산</button></div></div></div>`;
 }
 function render(id,arr){ document.getElementById(id).innerHTML = arr.length ? arr.map((v,i)=>card(v,i+1)).join("") : '<p class="empty">데이터가 없어요. "📡 수집 갱신"을 누르세요.</p>'; bind(); }
-function bind(){ document.querySelectorAll('.make').forEach(b=>b.onclick=async()=>{
-  b.textContent='⬇ 가져오는 중…'; b.disabled=true;
-  const r=await fetch('/api/digg_grab',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({url:b.dataset.url})}).then(r=>r.json());
-  b.textContent = r.ok ? '✓ '+r.date+' 폴더로' : '✗ 실패'; if(r.ok) b.style.background='#1a9e4b';
-}); }
+function bind(){
+  document.querySelectorAll('.make').forEach(b=>b.onclick=async()=>{
+    b.textContent='⬇ 가져오는 중…'; b.disabled=true;
+    const r=await fetch('/api/digg_grab',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({url:b.dataset.url})}).then(r=>r.json());
+    b.textContent = r.ok ? '✓ '+r.date+' 폴더로' : '✗ 실패'; if(r.ok) b.style.background='#1a9e4b';
+  });
+  document.querySelectorAll('.one').forEach(b=>b.onclick=async()=>{
+    b.textContent='⬇ 다운로드 중…'; b.disabled=true;
+    const r=await fetch('/api/digg_oneclick',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({url:b.dataset.url})}).then(r=>r.json());
+    if(!r.ok){ b.textContent='✗ '+(r.msg||'실패'); return; }
+    b.textContent='✂ 편집 시작…';
+    let started=false;
+    const poll=async()=>{
+      const s=await fetch('/api/progress').then(r=>r.json());
+      if(s.running){ started=true; b.textContent=`✂ 편집 중… ${s.current}/${s.total}`; setTimeout(poll,1500); }
+      else if(started && s.done){ b.textContent='✓ 완성 → 편집완료/'+r.date; b.style.background='#1a9e4b'; }
+      else setTimeout(poll,1500);
+    };
+    setTimeout(poll,1500);
+  });
+}
 async function load(){
   const r=await fetch('/api/digg?cat='+encodeURIComponent(CAT)).then(r=>r.json());
   const s=r.stats;
@@ -1203,6 +1240,10 @@ class H(BaseHTTPRequestHandler):
             n = int(self.headers.get("Content-Length", 0))
             data = json.loads(self.rfile.read(n) or b"{}")
             return self._send(200, json.dumps(digg_grab(data.get("url", ""))))
+        if self.path == "/api/digg_oneclick":
+            n = int(self.headers.get("Content-Length", 0))
+            data = json.loads(self.rfile.read(n) or b"{}")
+            return self._send(200, json.dumps(digg_oneclick(data.get("url", ""))))
         return self._send(404, "{}")
 
 def main():
