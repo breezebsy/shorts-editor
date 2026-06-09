@@ -4,7 +4,7 @@
 # 미러·확대·채도·HDR·속도·코너로고가리기·채널명자막(+선택 BGM)
 # - exe(PyInstaller)로 빌드되면 ffmpeg/폰트를 내부에서 사용
 # - 원본영상/편집완료 등은 실행파일 위치에서 위로 올라가며 자동 탐색
-import os, sys, subprocess, glob, tempfile, re, sqlite3, time, datetime
+import os, sys, subprocess, glob, tempfile, re, sqlite3, time, datetime, random
 
 # 윈도우 콘솔에서 한글이 깨지지 않게 UTF-8로 강제
 if sys.platform == "win32":
@@ -643,7 +643,7 @@ init();
 </html>
 '''
 
-VERSION = "2.2"
+VERSION = "2.3"
 STATE = {"running": False, "current": 0, "total": 0, "lines": [], "done": False, "date": ""}
 
 def hexrgb(h):
@@ -701,16 +701,24 @@ def mask_region(opts):
     return mx-mx%2, my-my%2, mw-mw%2, mh-mh%2
 
 def build_vf(opts, spd, tpl_win=None):
+    ev = opts.get("evade", False)  # 일치율 회피: 매 렌더마다 미세값을 random하게(고정값=패턴 감지)
     fl = []
     if opts.get("mirror", True): fl.append("hflip")
     z = max(100, int(opts.get("zoom", 113))) / 100.0
+    if ev: z = round(max(1.04, z + random.uniform(-0.02, 0.03)), 3)
     if opts.get("zoom_on", True) and z > 1.0:
-        fx = min(1.0, max(0.0, float(opts.get("zx", 0.5))))
-        fy = min(1.0, max(0.0, float(opts.get("zy", 0.5))))
+        fx = min(1.0, max(0.0, float(opts.get("zx", 0.5)) + (random.uniform(-0.06, 0.06) if ev else 0)))
+        fy = min(1.0, max(0.0, float(opts.get("zy", 0.5)) + (random.uniform(-0.06, 0.06) if ev else 0)))
         fl.append(f"scale=1080*{z}:1920*{z}:force_original_aspect_ratio=increase")
         fl.append(f"crop=1080:1920:(in_w-1080)*{fx}:(in_h-1920)*{fy}")
-    if opts.get("hdr", True): fl.append("eq=saturation=1.35:contrast=1.12:brightness=0.02")
+    if opts.get("hdr", True):
+        if ev:
+            sat = round(random.uniform(1.28, 1.42), 3); con = round(random.uniform(1.06, 1.16), 3); bri = round(random.uniform(-0.01, 0.04), 3)
+        else:
+            sat, con, bri = 1.35, 1.12, 0.02
+        fl.append(f"eq=saturation={sat}:contrast={con}:brightness={bri}")
     if opts.get("sharp", True): fl.append("unsharp=5:5:0.8")
+    if ev: fl.append(f"noise=alls={random.randint(2,5)}:allf=t")
     if opts.get("trim", False): fl.append("trim=start=0.3,setpts=PTS-STARTPTS")
     fl.append(f"setpts=PTS/{spd}")
     vf = "[0:v]" + ",".join(fl) + "[b];"
@@ -749,6 +757,7 @@ def edit_one(src, dst, cap_png, bgm, opts, tpl_path=None, start=None, seg=None, 
     eff = seg if seg else dur
     spd = (int(opts.get("speed", 108)) / 100.0)
     if eff > 12 and spd < 1.2: spd = 1.25
+    if opts.get("evade", False): spd = round(spd * random.uniform(0.99, 1.02), 3)
     tpl_win = template_window(tpl_path) if tpl_path else None
     vf = build_vf(opts, spd, tpl_win)
     cmd = [FFMPEG, "-y"]
@@ -771,6 +780,7 @@ def edit_one(src, dst, cap_png, bgm, opts, tpl_path=None, start=None, seg=None, 
     cmd += ["-filter_complex", vf + ";" + ab, "-map", "[v]", "-map", "[a]"]
     if short: cmd += ["-shortest"]
     if start is None: cmd += ["-t", "10"]
+    if opts.get("evade", False): cmd += ["-map_metadata", "-1", "-r", "30"]
     cmd += ["-c:v","libx264","-crf","20","-preset","fast","-pix_fmt","yuv420p","-c:a","aac","-b:a","128k", dst]
     r = subprocess.run(cmd, capture_output=True, text=True)
     return r.returncode == 0
@@ -1027,7 +1037,7 @@ def digg_oneclick(url):
     if not g.get("ok"): return g
     if STATE.get("running"):
         return {"ok": False, "msg": "편집 작업이 이미 진행 중입니다", "date": g["date"]}
-    threading.Thread(target=run_job, args=(g["date"], channel_name(), "(원본 소리 사용)", {}), kwargs={"only": g["file"]}, daemon=True).start()
+    threading.Thread(target=run_job, args=(g["date"], channel_name(), "(원본 소리 사용)", {"evade": True}), kwargs={"only": g["file"]}, daemon=True).start()
     return {"ok": True, "date": g["date"], "file": g["file"]}
 
 DIGG_HTML = r'''<!DOCTYPE html>

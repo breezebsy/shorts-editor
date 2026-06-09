@@ -8,7 +8,7 @@ import os, sys, urllib.request
 
 # app.py는 아래에서 동적 로드(exec)되므로, PyInstaller가 app.py의 의존성을
 # 분석하지 못한다. exe 빌드 시 이 모듈들이 번들에 포함되도록 미리 임포트한다.
-import sqlite3, json, threading, webbrowser, glob, tempfile, datetime, time, re, subprocess, shutil
+import sqlite3, json, threading, webbrowser, glob, tempfile, datetime, time, re, subprocess, shutil, random
 import http.server, urllib.parse
 try:
     from PIL import Image, ImageDraw, ImageFont
