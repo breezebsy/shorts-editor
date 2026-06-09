@@ -645,7 +645,7 @@ init();
 </html>
 '''
 
-VERSION = "2.4"
+VERSION = "2.5"
 STATE = {"running": False, "current": 0, "total": 0, "lines": [], "done": False, "date": ""}
 
 def hexrgb(h):
@@ -1086,6 +1086,95 @@ def gen_meta(title):
     except Exception as e:
         return {"ok": False, "msg": f"JSON 파싱 실패: {e}", "raw": (txt or "")[:200]}
 
+def _llm_vision(prompt, img_b64):
+    import urllib.request
+    s = load_settings(); prov = s.get("llm_provider", "gemini")
+    try:
+        if prov == "claude":
+            key = (s.get("claude_key") or "").strip()
+            if not key: return None, "Claude API 키 없음 (⚙ 설정)"
+            body = json.dumps({"model": s.get("claude_model", "claude-haiku-4-5-20251001"), "max_tokens": 1024,
+                "messages": [{"role": "user", "content": [
+                    {"type": "image", "source": {"type": "base64", "media_type": "image/png", "data": img_b64}},
+                    {"type": "text", "text": prompt}]}]}).encode("utf-8")
+            req = urllib.request.Request("https://api.anthropic.com/v1/messages", data=body,
+                headers={"x-api-key": key, "anthropic-version": "2023-06-01", "content-type": "application/json"})
+            r = json.loads(urllib.request.urlopen(req, timeout=60).read()); return r["content"][0]["text"], None
+        else:
+            key = (s.get("gemini_key") or "").strip()
+            if not key: return None, "Gemini API 키 없음 (⚙ 설정)"
+            model = s.get("gemini_model", "gemini-2.0-flash")
+            url = f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent?key={key}"
+            body = json.dumps({"contents": [{"parts": [{"text": prompt}, {"inline_data": {"mime_type": "image/png", "data": img_b64}}]}]}).encode("utf-8")
+            req = urllib.request.Request(url, data=body, headers={"content-type": "application/json"})
+            r = json.loads(urllib.request.urlopen(req, timeout=60).read()); return r["candidates"][0]["content"]["parts"][0]["text"], None
+    except Exception as e:
+        return None, f"{prov} vision 오류: {e}"
+
+# ── ViewStats 차트 누움 검증 (Playwright + Vision) ──
+VSCHART_PROFILE = os.path.join(os.path.expanduser("~"), ".shortseditor_vsprofile")  # ViewStats 로그인 세션 (드라이브 동기화 회피)
+VSCHART_STATE = {"login_running": False, "msg": ""}
+
+def _vs_login_worker():
+    VSCHART_STATE.update(login_running=True, msg="브라우저에서 ViewStats에 로그인하세요…")
+    try:
+        from playwright.sync_api import sync_playwright
+        with sync_playwright() as p:
+            ctx = p.chromium.launch_persistent_context(VSCHART_PROFILE, headless=False, viewport={"width": 1200, "height": 900})
+            pg = ctx.pages[0] if ctx.pages else ctx.new_page()
+            pg.goto("https://www.viewstats.com/login", timeout=60000)
+            try: pg.wait_for_function("!location.pathname.includes('login') && !location.pathname.includes('signup')", timeout=240000)
+            except Exception: pass
+            pg.wait_for_timeout(1500)
+            ctx.close()
+        VSCHART_STATE["msg"] = "로그인 세션 저장 완료 ✓"
+    except Exception as e:
+        VSCHART_STATE["msg"] = f"로그인 오류: {e}"
+    finally:
+        VSCHART_STATE["login_running"] = False
+
+def verify_flatline(handle, video_id):
+    try:
+        from playwright.sync_api import sync_playwright
+    except Exception:
+        return {"ok": False, "msg": "Playwright 미설치 — 터미널에서: pip install playwright && playwright install chromium"}
+    if not handle or not video_id:
+        return {"ok": False, "msg": "handle/video_id 필요"}
+    url = f"https://www.viewstats.com/@{handle}/videos/{video_id}"
+    try:
+        with sync_playwright() as p:
+            ctx = p.chromium.launch_persistent_context(VSCHART_PROFILE, headless=True, viewport={"width": 1200, "height": 1400})
+            pg = ctx.pages[0] if ctx.pages else ctx.new_page()
+            pg.goto(url, timeout=40000)
+            pg.wait_for_timeout(4500)
+            body = ""
+            try: body = pg.inner_text("body")
+            except Exception: pass
+            need_login = ("Unlock video stats" in body) or ("log in or sign up" in body)
+            png = pg.screenshot(full_page=False)
+            ctx.close()
+    except Exception as e:
+        return {"ok": False, "msg": f"차트 로딩 실패: {e}"}
+    import base64
+    img_b64 = base64.b64encode(png).decode()
+    if need_login:
+        return {"ok": True, "need_login": True, "img": img_b64, "url": url,
+                "msg": "ViewStats 차트가 로그인 게이트입니다. '📊 ViewStats 로그인'을 먼저 한 번 하세요."}
+    prompt = ("아래는 유튜브 영상의 '조회수 추이(Total Views over time)' 차트 스크린샷이다. "
+        "이 영상의 누적 조회수 곡선이 더 이상 증가하지 않고 평평하게 '누웠는지' 판정하라. "
+        "기준: 그래프 끝부분이 수평(증가율≈0)으로 몇 개월 지속되면 '시체영상'(재업로드 안전). "
+        "아직 위로 꺾여 올라가면 살아있는 것. 반드시 아래 JSON만 출력: "
+        '{"flat": true/false, "months_flat": 숫자, "confidence": 0~1, "reason": "한 줄 근거"}')
+    txt, err = _llm_vision(prompt, img_b64)
+    res = {"ok": True, "need_login": False, "img": img_b64, "url": url}
+    if err:
+        res["verdict_error"] = err
+    else:
+        m = re.search(r"\{.*\}", txt or "", re.S)
+        try: res["verdict"] = json.loads(m.group(0)) if m else {"raw": (txt or "")[:200]}
+        except Exception: res["verdict"] = {"raw": (txt or "")[:200]}
+    return res
+
 def digg_oneclick(url, title=""):
     g = digg_grab(url)
     if not g.get("ok"): return g
@@ -1138,6 +1227,7 @@ DIGG_HTML = r'''<!DOCTYPE html>
 </div>
 <div class="bar">
   <button class="btn" id="crawl">📡 수집 갱신</button>
+  <button class="btn ghost" id="vslogin">📊 ViewStats 로그인</button>
   <span id="prog"></span>
   <span class="stat" id="stats"></span>
 </div>
@@ -1154,6 +1244,11 @@ DIGG_HTML = r'''<!DOCTYPE html>
       <span><button class="btn sm" id="metaCopy">📋 전체 복사</button> <button class="btn ghost sm" id="metaClose">닫기</button></span>
     </div>
     <textarea id="metaText" style="width:100%;height:140px;border:1px solid #d2d2d7;border-radius:10px;padding:10px;font-size:13px;font-family:inherit"></textarea>
+    <div id="chartBox" style="display:none">
+      <div id="verdict" style="font-size:14px;font-weight:700;margin-bottom:8px"></div>
+      <img id="chartImg" style="width:100%;max-height:40vh;object-fit:contain;border:1px solid #e3e3e8;border-radius:10px;background:#fff">
+      <a id="chartOpen" href="#" target="_blank" style="font-size:12px;color:var(--blue);display:inline-block;margin-top:6px">ViewStats에서 직접 보기 ↗</a>
+    </div>
   </div>
 </div>
 <script>
@@ -1172,18 +1267,31 @@ function card(v,rank){
    <div class="m"><div class="t"><a href="${yt}" target="_blank">${(v.title||'').slice(0,70)}</a></div>
    <div class="s"><span class="ch">@${v.handle}</span> · 👁${nf(v.current_views)} ${age} ${flat}</div>
    <div class="act"><a class="btn ghost sm" href="${yt}" target="_blank">유튜브</a>
+   <button class="btn ghost sm flat" data-handle="${v.handle||''}" data-id="${id}">📊 누움검증</button>
    <button class="btn ghost sm meta" data-title="${(v.title||'').replace(/"/g,'&quot;').slice(0,140)}">📋 제목·태그</button>
    <button class="btn ghost sm make" data-url="${yt}">⬇ 다운만</button>
    <button class="btn sm one" data-url="${yt}" data-title="${(v.title||'').replace(/"/g,'&quot;').slice(0,140)}">⚡ 원클릭</button></div></div></div>`;
 }
 function render(id,arr){ document.getElementById(id).innerHTML = arr.length ? arr.map((v,i)=>card(v,i+1)).join("") : '<p class="empty">데이터가 없어요. "📡 수집 갱신"을 누르세요.</p>'; bind(); }
 function fmtMeta(m){ return `${m.title}\n\n${m.desc}\n\n${(m.tags||[]).join(' ')}`; }
-function showMeta(text,status){ document.getElementById('metaText').value=text; document.getElementById('metaStatus').textContent=status||'📋 생성된 메타데이터'; document.getElementById('metaPanel').style.display='block'; }
+function showMeta(text,status){ document.getElementById('metaText').value=text; document.getElementById('metaText').style.display='block'; document.getElementById('chartBox').style.display='none'; document.getElementById('metaCopy').style.display='inline-block'; document.getElementById('metaStatus').textContent=status||'📋 생성된 메타데이터'; document.getElementById('metaPanel').style.display='block'; }
+function showChart(imgB64, verdictHtml, url, status){ document.getElementById('metaText').style.display='none'; document.getElementById('metaCopy').style.display='none'; document.getElementById('chartBox').style.display='block'; document.getElementById('chartImg').src='data:image/png;base64,'+imgB64; document.getElementById('verdict').innerHTML=verdictHtml; const a=document.getElementById('chartOpen'); a.href=url||'#'; document.getElementById('metaStatus').textContent=status||'📊 누움 검증'; document.getElementById('metaPanel').style.display='block'; }
 function bind(){
   document.querySelectorAll('.make').forEach(b=>b.onclick=async()=>{
     b.textContent='⬇ 가져오는 중…'; b.disabled=true;
     const r=await fetch('/api/digg_grab',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({url:b.dataset.url})}).then(r=>r.json());
     b.textContent = r.ok ? '✓ '+r.date+' 폴더로' : '✗ 실패'; if(r.ok) b.style.background='#1a9e4b';
+  });
+  document.querySelectorAll('.flat').forEach(b=>b.onclick=async()=>{
+    const o=b.textContent; b.textContent='📊 차트 분석 중…'; b.disabled=true;
+    const r=await fetch('/api/verify_flatline',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({handle:b.dataset.handle,id:b.dataset.id})}).then(r=>r.json());
+    b.disabled=false; b.textContent=o;
+    if(!r.ok){ showMeta(r.msg||'실패','⚠ 누움검증 실패'); return; }
+    if(r.need_login){ showChart(r.img,'⚠ 차트가 로그인 게이트입니다 — 상단 "📊 ViewStats 로그인"을 먼저 하세요.',r.url,'📊 로그인 필요'); return; }
+    let vh='';
+    if(r.verdict_error){ vh='⚠ AI 판정 실패: '+r.verdict_error+' (차트는 눈으로 확인하세요)'; }
+    else { const v=r.verdict||{}; const flat=v.flat; vh = flat===true ? `💀 누움 확정 — 약 ${v.months_flat||'?'}개월 평평 (확신 ${Math.round((v.confidence||0)*100)}%)` : (flat===false ? `📈 아직 살아있음 (확신 ${Math.round((v.confidence||0)*100)}%)` : '판정 불명'); vh += `<div style="font-weight:400;font-size:12px;color:#6e6e73;margin-top:3px">${v.reason||v.raw||''}</div>`; vh = `<span style="color:${flat===true?'#d2691e':(flat===false?'#1a9e4b':'#6e6e73')}">${vh}</span>`; }
+    showChart(r.img, vh, r.url, '📊 누움 검증 (ViewStats 차트)');
   });
   document.querySelectorAll('.meta').forEach(b=>b.onclick=async()=>{
     const o=b.textContent; b.textContent='🤖 생성 중…'; b.disabled=true;
@@ -1220,6 +1328,12 @@ async function load(){
 }
 document.getElementById('crawl').onclick=async()=>{
   await fetch('/api/digg_crawl',{method:'POST'}); document.getElementById('prog').textContent='⏳ 수집 시작…'; setTimeout(load,1500);
+};
+document.getElementById('vslogin').onclick=async()=>{
+  await fetch('/api/vschart_login',{method:'POST'});
+  const prog=document.getElementById('prog');
+  const poll=async()=>{ const s=await fetch('/api/vschart_login_state').then(r=>r.json()); prog.textContent='📊 '+(s.msg||''); if(s.login_running) setTimeout(poll,2000); };
+  setTimeout(poll,1000);
 };
 load();
 </script></body></html>'''
@@ -1341,6 +1455,8 @@ class H(BaseHTTPRequestHandler):
             from urllib.parse import parse_qs, urlparse
             q = parse_qs(urlparse(self.path).query)
             return self._send(200, json.dumps(digg_data((q.get("cat") or [""])[0])))
+        if p == "/api/vschart_login_state":
+            return self._send(200, json.dumps(VSCHART_STATE))
         if p == "/settings":
             return self._send(200, SETTINGS_HTML, "text/html; charset=utf-8")
         if p == "/api/settings":
@@ -1409,6 +1525,14 @@ class H(BaseHTTPRequestHandler):
             n = int(self.headers.get("Content-Length", 0))
             data = json.loads(self.rfile.read(n) or b"{}")
             return self._send(200, json.dumps(gen_meta(data.get("title", ""))))
+        if self.path == "/api/verify_flatline":
+            n = int(self.headers.get("Content-Length", 0))
+            data = json.loads(self.rfile.read(n) or b"{}")
+            return self._send(200, json.dumps(verify_flatline(data.get("handle", ""), data.get("id", ""))))
+        if self.path == "/api/vschart_login":
+            if not VSCHART_STATE["login_running"]:
+                threading.Thread(target=_vs_login_worker, daemon=True).start()
+            return self._send(200, json.dumps({"ok": True}))
         if self.path == "/api/settings":
             n = int(self.headers.get("Content-Length", 0))
             data = json.loads(self.rfile.read(n) or b"{}")
