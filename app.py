@@ -645,7 +645,7 @@ init();
 </html>
 '''
 
-VERSION = "2.5"
+VERSION = "2.6"
 STATE = {"running": False, "current": 0, "total": 0, "lines": [], "done": False, "date": ""}
 
 def hexrgb(h):
@@ -982,11 +982,15 @@ def digg_crawl(limit=0, enrich_cap=80, min_views=1000000, delay=3):
                     con.execute("UPDATE videos SET last_views=current_views,current_views=?,delta=?,title=?,last_checked=? WHERE youtube_id=?", (views, views-row[0], title, t, vid))
                 con.execute("INSERT INTO snapshots(youtube_id,ts,views) VALUES(?,?,?)", (vid, t, views))
             con.commit(); time.sleep(delay)
-        cands = con.execute("SELECT youtube_id FROM videos WHERE current_views>=? AND enriched=0 ORDER BY current_views DESC LIMIT ?", (min_views, enrich_cap)).fetchall()
+        cands = con.execute("""SELECT youtube_id FROM videos WHERE current_views>=? AND enriched<=0
+            ORDER BY enriched DESC,
+                     (CASE WHEN last_views IS NOT NULL AND CAST(delta AS REAL)/current_views<0.005 THEN 0 ELSE 1 END),
+                     current_views DESC LIMIT ?""", (min_views, enrich_cap)).fetchall()
         DIGG_STATE.update(msg="옛영상 날짜 보강", total=len(cands), done=0)
         for i,(vid,) in enumerate(cands, 1):
             ud,age,lk,cm = digg_enrich_one(vid)
-            con.execute("UPDATE videos SET upload_date=?,age_days=?,like_count=?,comment_count=?,enriched=1 WHERE youtube_id=?", (ud,age,lk,cm,vid))
+            # 실패(-1)는 다음 회차 재시도 — enriched=1로 묻으면 영구 미보강이 됨
+            con.execute("UPDATE videos SET upload_date=?,age_days=?,like_count=?,comment_count=?,enriched=? WHERE youtube_id=?", (ud,age,lk,cm, 1 if ud else -1, vid))
             DIGG_STATE.update(done=i)
             if i % 10 == 0: con.commit()
             time.sleep(max(1.5, delay-1))
@@ -997,7 +1001,35 @@ def digg_crawl(limit=0, enrich_cap=80, min_views=1000000, delay=3):
     finally:
         DIGG_STATE["running"] = False
 
+# ── 사용한 소재 추적 (중복 재업로드 방지) ──
+USED_FILE = os.path.join(RUN_DIR, "digg_used.json")
+def _used_load():
+    try:
+        with open(USED_FILE, encoding="utf-8") as f: return json.load(f)
+    except Exception: return {}
+def _used_mark(vid):
+    if not vid: return
+    d = _used_load(); d[vid] = _utcnow()
+    try:
+        with open(USED_FILE, "w", encoding="utf-8") as f: json.dump(d, f, ensure_ascii=False)
+    except Exception: pass
+
+# 맥 크롤러(crawl.py)가 Drive로 배달하는 도굴 후보 JSON — 있으면 DB를 열지 않는다(SQLite+Drive 충돌 0)
+CAND_FILE = os.path.join(RUN_DIR, "digg_candidates.json")
+
 def digg_data(category="", min_views=1000000, age=120):
+    used = _used_load()
+    def mark(rows):
+        for r in rows: r["used"] = r.get("youtube_id") in used
+        return rows
+    try:
+        with open(CAND_FILE, encoding="utf-8") as f: d = json.load(f)
+        def cf(rows): return [r for r in rows if not category or r.get("category") == category]
+        return {"stats": d.get("stats", {}), "digg": mark(cf(d.get("digg", []))[:30]),
+                "surge": mark(cf(d.get("surge", []))[:12]), "top": mark(cf(d.get("top", []))[:24]),
+                "state": DIGG_STATE, "source": "json", "generated_at": d.get("generated_at", "")}
+    except Exception:
+        pass
     con = _digg_con(); con.row_factory = sqlite3.Row
     cw = " AND category=? " if category else " "; ca = (category,) if category else ()
     def rows(sql, a=()):
@@ -1013,7 +1045,7 @@ def digg_data(category="", min_views=1000000, age=120):
     surge = rows(f"SELECT youtube_id,handle,title,current_views,last_views,delta,age_days,duration FROM videos WHERE last_views IS NOT NULL {cw} ORDER BY delta DESC LIMIT 12", ca)
     top = rows(f"SELECT youtube_id,handle,title,current_views,last_views,delta,age_days,duration FROM videos WHERE 1=1 {cw} ORDER BY current_views DESC LIMIT 24", ca)
     con.close()
-    return {"stats": stats, "digg": digg, "surge": surge, "top": top, "state": DIGG_STATE}
+    return {"stats": stats, "digg": mark(digg), "surge": mark(surge), "top": mark(top), "state": DIGG_STATE, "source": "db"}
 
 def digg_grab(url):
     if not url: return {"ok": False, "msg": "URL 없음"}
@@ -1030,6 +1062,7 @@ def digg_grab(url):
             mp4s = sorted(glob.glob(os.path.join(folder, "*.mp4")), key=os.path.getmtime)
             fname = os.path.basename(mp4s[-1]) if mp4s else None
         if not fname: return {"ok": False, "msg": "다운로드 파일을 찾을 수 없음"}
+        _used_mark(vid_id)
         return {"ok": True, "date": day, "file": fname}
     except Exception as e:
         return {"ok": False, "msg": str(e)}
@@ -1220,6 +1253,7 @@ DIGG_HTML = r'''<!DOCTYPE html>
   .s{ font-size:11.5px; color:var(--sub); margin-top:5px; display:flex; gap:5px; flex-wrap:wrap; align-items:center; }
   .ch{ color:var(--blue); } .dead{ color:var(--dead); font-weight:700; } .good{ color:var(--good); font-weight:700; }
   .act{ display:flex; gap:5px; margin-top:8px; } .empty{ color:var(--sub); font-size:13px; }
+  .card.used{ opacity:.45; } .usedtag{ color:#8e8e93; font-weight:700; }
   #prog{ font-size:12.5px; color:var(--blue); }
 </style></head><body><div class="wrap">
 <div class="top"><h1>💀 시체영상 도굴 <span class="g">· 농기계/지식 (월천식)</span></h1>
@@ -1262,10 +1296,10 @@ function card(v,rank){
   let flat="";
   if(v.last_views!=null && v.current_views){ const r=v.delta/v.current_views; flat = r<0.005 ? '<span class="dead">💀누움</span>' : (v.delta>0?'<span class="good">📈+'+nf(v.delta)+'</span>':''); }
   const age=v.age_days?('🗓'+ageL(v.age_days)):'';
-  return `<div class="card"><span class="rank">${rank}</span>
+  return `<div class="card${v.used?' used':''}"><span class="rank">${rank}</span>
    <a href="${yt}" target="_blank"><img loading="lazy" src="${th}"></a>
    <div class="m"><div class="t"><a href="${yt}" target="_blank">${(v.title||'').slice(0,70)}</a></div>
-   <div class="s"><span class="ch">@${v.handle}</span> · 👁${nf(v.current_views)} ${age} ${flat}</div>
+   <div class="s"><span class="ch">@${v.handle}</span> · 👁${nf(v.current_views)} ${age} ${flat} ${v.used?'<span class="usedtag">✓ 사용함</span>':''}</div>
    <div class="act"><a class="btn ghost sm" href="${yt}" target="_blank">유튜브</a>
    <button class="btn ghost sm flat" data-handle="${v.handle||''}" data-id="${id}">📊 누움검증</button>
    <button class="btn ghost sm meta" data-title="${(v.title||'').replace(/"/g,'&quot;').slice(0,140)}">📋 제목·태그</button>
@@ -1280,7 +1314,7 @@ function bind(){
   document.querySelectorAll('.make').forEach(b=>b.onclick=async()=>{
     b.textContent='⬇ 가져오는 중…'; b.disabled=true;
     const r=await fetch('/api/digg_grab',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({url:b.dataset.url})}).then(r=>r.json());
-    b.textContent = r.ok ? '✓ '+r.date+' 폴더로' : '✗ 실패'; if(r.ok) b.style.background='#1a9e4b';
+    b.textContent = r.ok ? '✓ '+r.date+' 폴더로' : '✗ 실패'; if(r.ok){ b.style.background='#1a9e4b'; b.closest('.card').classList.add('used'); }
   });
   document.querySelectorAll('.flat').forEach(b=>b.onclick=async()=>{
     const o=b.textContent; b.textContent='📊 차트 분석 중…'; b.disabled=true;
@@ -1304,6 +1338,7 @@ function bind(){
     b.textContent='⬇ 다운로드 중…'; b.disabled=true;
     const r=await fetch('/api/digg_oneclick',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({url:b.dataset.url,title:b.dataset.title})}).then(r=>r.json());
     if(!r.ok){ b.textContent='✗ '+(r.msg||'실패'); return; }
+    b.closest('.card').classList.add('used');
     if(r.meta) showMeta(fmtMeta(r.meta),'📋 제목·태그 (편집 진행 중 · 복사 가능)');
     b.textContent='✂ 편집 시작…';
     let started=false;
@@ -1319,7 +1354,8 @@ function bind(){
 async function load(){
   const r=await fetch('/api/digg?cat='+encodeURIComponent(CAT)).then(r=>r.json());
   const s=r.stats;
-  document.getElementById('stats').textContent=`채널 ${s.channels} · 영상 ${nf(s.total)} · 날짜보강 ${s.enriched}`;
+  document.getElementById('stats').textContent=`채널 ${s.channels} · 영상 ${nf(s.total)} · 날짜보강 ${s.enriched}` + (r.source==='json'?` · 📦 맥 수집본 ${(r.generated_at||'').slice(0,16).replace('T',' ')}`:'');
+  if(r.source==='json') document.getElementById('crawl').style.display='none';
   document.getElementById('chips').innerHTML=['<span class="chip '+(CAT===''?'on':'')+'" data-c="">전체</span>'].concat((s.cats||[]).map(c=>'<span class="chip '+(CAT===c?'on':'')+'" data-c="'+c+'">'+c+'</span>')).join('');
   document.querySelectorAll('.chip').forEach(ch=>ch.onclick=()=>{ CAT=ch.dataset.c; load(); });
   render('digg',r.digg); render('surge',r.surge); render('top',r.top);
