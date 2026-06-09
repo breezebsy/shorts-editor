@@ -4,7 +4,7 @@
 # 미러·확대·채도·HDR·속도·코너로고가리기·채널명자막(+선택 BGM)
 # - exe(PyInstaller)로 빌드되면 ffmpeg/폰트를 내부에서 사용
 # - 원본영상/편집완료 등은 실행파일 위치에서 위로 올라가며 자동 탐색
-import os, sys, subprocess, glob, tempfile, re
+import os, sys, subprocess, glob, tempfile, re, sqlite3, time, datetime
 
 # 윈도우 콘솔에서 한글이 깨지지 않게 UTF-8로 강제
 if sys.platform == "win32":
@@ -237,6 +237,7 @@ DASHBOARD_HTML = r'''<!DOCTYPE html>
     <div class="tabs">
       <a class="tab active" href="/">🎬 대량 편집</a>
       <a class="tab" href="/single">✂ 개별 편집</a>
+      <a class="tab" href="/digg">💀 도굴</a>
     </div>
     <div style="display:flex;gap:10px;align-items:center">
       <div class="pill"><span class="dot"></span><span id="ver">v2.0</span> · 자동업데이트 켜짐</div>
@@ -466,6 +467,7 @@ SINGLE_HTML = r'''<!DOCTYPE html>
     <div class="tabs">
       <a class="tab" href="/">🎬 대량 편집</a>
       <a class="tab active" href="/single">✂ 개별 편집</a>
+      <a class="tab" href="/digg">💀 도굴</a>
     </div>
   </div>
   <div class="grid">
@@ -641,7 +643,7 @@ init();
 </html>
 '''
 
-VERSION = "2.0"
+VERSION = "2.1"
 STATE = {"running": False, "current": 0, "total": 0, "lines": [], "done": False, "date": ""}
 
 def hexrgb(h):
@@ -888,6 +890,214 @@ def do_preview(data):
     except Exception:
         return None
 
+# ════════════════ 💀 시체영상 도굴 모듈 ════════════════
+DIGG_DB = os.path.join(RUN_DIR, "shorts.db")
+DIGG_STATE = {"running": False, "msg": "대기", "done": 0, "total": 0}
+DIGG_SEEDS = [
+    ("Timberteamhdpm","농기계"),("Village_gear","농기계"),("wisdompouchannel","지식"),
+    ("WorkerVision","농기계"),("Toolholder","공구"),("TechOnlineShow","기계"),
+    ("Farmcrafts-b3t","농기계"),("tomobox7763","공구"),("TUAHALAMShorts","농기계"),
+    ("HangLyDIY","DIY"),("Cleversolution-i7o","DIY"),("speedfixmechanics","기계"),
+    ("BrilliantVictorIndustries","기계"),("MasterMechanism-m5s","기계"),("craftspeople","공구"),
+]
+DIGG_SCHEMA = """
+CREATE TABLE IF NOT EXISTS channels(handle TEXT PRIMARY KEY, category TEXT, last_crawled TEXT);
+CREATE TABLE IF NOT EXISTS videos(youtube_id TEXT PRIMARY KEY, handle TEXT, category TEXT, title TEXT, duration INTEGER,
+  current_views INTEGER, last_views INTEGER, delta INTEGER, upload_date TEXT, age_days INTEGER,
+  like_count INTEGER, comment_count INTEGER, enriched INTEGER DEFAULT 0, first_seen TEXT, last_checked TEXT);
+CREATE TABLE IF NOT EXISTS snapshots(youtube_id TEXT, ts TEXT, views INTEGER);
+"""
+
+def find_ytdlp():
+    for d in [BUNDLE, RUN_DIR, os.path.join(RUN_DIR, "_bin_win")]:
+        for n in ["yt-dlp.exe", "yt-dlp"]:
+            p = os.path.join(d, n)
+            if os.path.exists(p): return p
+    return "yt-dlp"
+YTDLP = find_ytdlp()
+
+def _digg_con():
+    con = sqlite3.connect(DIGG_DB); con.executescript(DIGG_SCHEMA); return con
+
+def _ytrun(args, timeout=180):
+    try: return subprocess.run([YTDLP]+args, capture_output=True, text=True, timeout=timeout).stdout
+    except Exception: return ""
+
+def _utcnow():
+    return datetime.datetime.now(datetime.timezone.utc).isoformat(timespec="seconds")
+
+def digg_catalog(handle, limit=0):
+    args = ["--flat-playlist","--dump-json","--no-warnings"]
+    if limit: args += ["--playlist-end", str(limit)]
+    args += [f"https://www.youtube.com/@{handle}/shorts"]
+    rows = []
+    for line in _ytrun(args).splitlines():
+        try:
+            d = json.loads(line)
+            if d.get("id") and d.get("view_count") is not None:
+                rows.append((d["id"], d.get("title",""), int(d["view_count"]), d.get("duration")))
+        except Exception: pass
+    return rows
+
+def digg_enrich_one(vid):
+    out = _ytrun(["--dump-json","--no-warnings","--skip-download", f"https://www.youtube.com/shorts/{vid}"], timeout=60)
+    try:
+        d = json.loads(out); ud = d.get("upload_date"); age = None
+        if ud:
+            try: age = (datetime.date.today() - datetime.date(int(ud[:4]),int(ud[4:6]),int(ud[6:8]))).days
+            except Exception: pass
+        return ud, age, d.get("like_count"), d.get("comment_count")
+    except Exception:
+        return None, None, None, None
+
+def digg_crawl(limit=0, enrich_cap=80, min_views=1000000, delay=3):
+    if DIGG_STATE["running"]: return
+    DIGG_STATE.update(running=True, msg="수집 시작", done=0, total=len(DIGG_SEEDS))
+    try:
+        con = _digg_con(); t = _utcnow()
+        for i,(h,c) in enumerate(DIGG_SEEDS, 1):
+            DIGG_STATE.update(msg=f"@{h} 카탈로그 수집 중", done=i, total=len(DIGG_SEEDS))
+            con.execute("INSERT INTO channels(handle,category,last_crawled) VALUES(?,?,?) ON CONFLICT(handle) DO UPDATE SET last_crawled=?", (h,c,t,t))
+            for vid,title,views,dur in digg_catalog(h, limit):
+                row = con.execute("SELECT current_views FROM videos WHERE youtube_id=?", (vid,)).fetchone()
+                if row is None:
+                    con.execute("INSERT INTO videos(youtube_id,handle,category,title,duration,current_views,last_views,delta,first_seen,last_checked) VALUES(?,?,?,?,?,?,?,?,?,?)", (vid,h,c,title,dur,views,None,0,t,t))
+                else:
+                    con.execute("UPDATE videos SET last_views=current_views,current_views=?,delta=?,title=?,last_checked=? WHERE youtube_id=?", (views, views-row[0], title, t, vid))
+                con.execute("INSERT INTO snapshots(youtube_id,ts,views) VALUES(?,?,?)", (vid, t, views))
+            con.commit(); time.sleep(delay)
+        cands = con.execute("SELECT youtube_id FROM videos WHERE current_views>=? AND enriched=0 ORDER BY current_views DESC LIMIT ?", (min_views, enrich_cap)).fetchall()
+        DIGG_STATE.update(msg="옛영상 날짜 보강", total=len(cands), done=0)
+        for i,(vid,) in enumerate(cands, 1):
+            ud,age,lk,cm = digg_enrich_one(vid)
+            con.execute("UPDATE videos SET upload_date=?,age_days=?,like_count=?,comment_count=?,enriched=1 WHERE youtube_id=?", (ud,age,lk,cm,vid))
+            DIGG_STATE.update(done=i)
+            if i % 10 == 0: con.commit()
+            time.sleep(max(1.5, delay-1))
+        con.commit(); con.close()
+        DIGG_STATE.update(msg="완료 ✓")
+    except Exception as e:
+        DIGG_STATE.update(msg=f"오류: {e}")
+    finally:
+        DIGG_STATE["running"] = False
+
+def digg_data(category="", min_views=1000000, age=120):
+    con = _digg_con(); con.row_factory = sqlite3.Row
+    cw = " AND category=? " if category else " "; ca = (category,) if category else ()
+    def rows(sql, a=()):
+        try: return [dict(r) for r in con.execute(sql, a).fetchall()]
+        except Exception: return []
+    stats = {
+        "total": (rows("SELECT COUNT(*) c FROM videos") or [{"c":0}])[0]["c"],
+        "channels": (rows("SELECT COUNT(*) c FROM channels") or [{"c":0}])[0]["c"],
+        "enriched": (rows("SELECT COUNT(*) c FROM videos WHERE enriched=1") or [{"c":0}])[0]["c"],
+        "cats": [r["category"] for r in rows("SELECT DISTINCT category FROM channels WHERE category IS NOT NULL ORDER BY category")],
+    }
+    digg = rows(f"SELECT youtube_id,handle,title,current_views,last_views,delta,age_days,duration FROM videos WHERE current_views>=? AND age_days>=? {cw} ORDER BY (CASE WHEN last_views IS NOT NULL AND CAST(delta AS REAL)/current_views<0.005 THEN 0 ELSE 1 END), current_views DESC LIMIT 30", (min_views, age)+ca)
+    surge = rows(f"SELECT youtube_id,handle,title,current_views,last_views,delta,age_days,duration FROM videos WHERE last_views IS NOT NULL {cw} ORDER BY delta DESC LIMIT 12", ca)
+    top = rows(f"SELECT youtube_id,handle,title,current_views,last_views,delta,age_days,duration FROM videos WHERE 1=1 {cw} ORDER BY current_views DESC LIMIT 24", ca)
+    con.close()
+    return {"stats": stats, "digg": digg, "surge": surge, "top": top, "state": DIGG_STATE}
+
+def digg_grab(url):
+    if not url: return {"ok": False, "msg": "URL 없음"}
+    day = datetime.date.today().strftime("%y%m%d")
+    folder = os.path.join(SRC_ROOT, day); os.makedirs(folder, exist_ok=True)
+    out = os.path.join(folder, "%(id)s.%(ext)s")
+    try:
+        subprocess.run([YTDLP,"-f","bestvideo[height<=1080]+bestaudio/best","--merge-output-format","mp4","-o",out,"--no-warnings",url], timeout=300)
+        return {"ok": True, "date": day}
+    except Exception as e:
+        return {"ok": False, "msg": str(e)}
+
+DIGG_HTML = r'''<!DOCTYPE html>
+<html lang="ko"><head><meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>💀 시체영상 도굴</title>
+<style>
+  :root{ --blue:#0071e3; --ink:#1d1d1f; --sub:#6e6e73; --bg:#f5f5f7; --dead:#d2691e; --good:#1a9e4b; }
+  *{ box-sizing:border-box; margin:0; padding:0; }
+  body{ font-family:-apple-system,"Apple SD Gothic Neo","Malgun Gothic",sans-serif; background:var(--bg); color:var(--ink); padding:28px 22px; }
+  .wrap{ max-width:1100px; margin:0 auto; }
+  .top{ display:flex; align-items:center; justify-content:space-between; flex-wrap:wrap; gap:12px; margin-bottom:16px; }
+  h1{ font-size:23px; font-weight:700; letter-spacing:-.5px; }
+  h1 .g{ color:var(--sub); font-weight:600; font-size:15px; }
+  .tabs{ display:inline-flex; background:#e8e8ed; border-radius:13px; padding:4px; gap:3px; }
+  .tab{ padding:9px 20px; border-radius:10px; font-size:14px; font-weight:600; color:#5f5f66; text-decoration:none; }
+  .tab.active{ background:#fff; color:var(--ink); box-shadow:0 1px 4px rgba(0,0,0,.14); }
+  .bar{ display:flex; align-items:center; gap:12px; flex-wrap:wrap; margin:6px 0 16px; }
+  .stat{ font-size:13px; color:var(--sub); }
+  .btn{ background:var(--blue); color:#fff; border:none; padding:9px 16px; border-radius:11px; font-size:13.5px; font-weight:600; cursor:pointer; }
+  .btn.sm{ padding:6px 11px; font-size:12px; border-radius:9px; }
+  .btn.ghost{ background:#fff; color:var(--ink); box-shadow:0 1px 3px rgba(0,0,0,.1); }
+  .chips{ display:flex; gap:7px; flex-wrap:wrap; margin-bottom:8px; }
+  .chip{ padding:5px 12px; border-radius:999px; background:#fff; color:var(--sub); font-size:13px; cursor:pointer; box-shadow:0 1px 3px rgba(0,0,0,.06); }
+  .chip.on{ background:var(--blue); color:#fff; font-weight:700; }
+  h2{ font-size:16px; margin:24px 0 10px; } h2.dig{ color:var(--dead); } .hint{ font-size:12px; color:var(--sub); font-weight:400; }
+  .grid{ display:grid; grid-template-columns:repeat(auto-fill,minmax(230px,1fr)); gap:13px; }
+  .card{ background:#fff; border-radius:14px; overflow:hidden; box-shadow:0 2px 10px rgba(0,0,0,.05); position:relative; }
+  .card img{ width:100%; aspect-ratio:16/9; object-fit:cover; display:block; background:#ddd; }
+  .rank{ position:absolute; top:7px; left:7px; background:#000a; color:#fff; font-weight:800; font-size:11px; padding:2px 7px; border-radius:7px; }
+  .m{ padding:9px 11px; } .t{ font-size:12.5px; line-height:1.35; height:34px; overflow:hidden; }
+  .t a{ color:var(--ink); text-decoration:none; }
+  .s{ font-size:11.5px; color:var(--sub); margin-top:5px; display:flex; gap:5px; flex-wrap:wrap; align-items:center; }
+  .ch{ color:var(--blue); } .dead{ color:var(--dead); font-weight:700; } .good{ color:var(--good); font-weight:700; }
+  .act{ display:flex; gap:5px; margin-top:8px; } .empty{ color:var(--sub); font-size:13px; }
+  #prog{ font-size:12.5px; color:var(--blue); }
+</style></head><body><div class="wrap">
+<div class="top"><h1>💀 시체영상 도굴 <span class="g">· 농기계/지식 (월천식)</span></h1>
+  <div class="tabs"><a class="tab" href="/">🎬 대량 편집</a><a class="tab" href="/single">✂ 개별 편집</a><a class="tab active" href="/digg">💀 도굴</a></div>
+</div>
+<div class="bar">
+  <button class="btn" id="crawl">📡 수집 갱신</button>
+  <span id="prog"></span>
+  <span class="stat" id="stats"></span>
+</div>
+<div class="chips" id="chips"></div>
+<h2 class="dig">💀 도굴 후보 <span class="hint">— 100만+ 조회 · 120일+ 옛영상 · 성장 멈춘 것 우선 (= 월천 핵심)</span></h2>
+<div class="grid" id="digg"></div>
+<h2 style="color:var(--good)">🔥 급상승 <span class="hint">(24h 증가량 · 매일 수집해야 잡힘)</span></h2><div class="grid" id="surge"></div>
+<h2 style="color:var(--blue)">📈 조회수 상위</h2><div class="grid" id="top"></div>
+</div>
+<script>
+let CAT="";
+const nf=n=>Number(n).toLocaleString();
+function ageL(d){ if(!d) return ""; if(d>=365) return Math.floor(d/365)+"년전"; if(d>=30) return Math.floor(d/30)+"개월전"; return d+"일전"; }
+function card(v,rank){
+  const id=v.youtube_id, yt="https://www.youtube.com/shorts/"+id, th="https://i.ytimg.com/vi/"+id+"/mqdefault.jpg";
+  let flat="";
+  if(v.last_views!=null && v.current_views){ const r=v.delta/v.current_views; flat = r<0.005 ? '<span class="dead">💀누움</span>' : (v.delta>0?'<span class="good">📈+'+nf(v.delta)+'</span>':''); }
+  const age=v.age_days?('🗓'+ageL(v.age_days)):'';
+  return `<div class="card"><span class="rank">${rank}</span>
+   <a href="${yt}" target="_blank"><img loading="lazy" src="${th}"></a>
+   <div class="m"><div class="t"><a href="${yt}" target="_blank">${(v.title||'').slice(0,70)}</a></div>
+   <div class="s"><span class="ch">@${v.handle}</span> · 👁${nf(v.current_views)} ${age} ${flat}</div>
+   <div class="act"><a class="btn ghost sm" href="${yt}" target="_blank">유튜브</a>
+   <button class="btn sm make" data-url="${yt}">🎬 가져와 편집</button></div></div></div>`;
+}
+function render(id,arr){ document.getElementById(id).innerHTML = arr.length ? arr.map((v,i)=>card(v,i+1)).join("") : '<p class="empty">데이터가 없어요. "📡 수집 갱신"을 누르세요.</p>'; bind(); }
+function bind(){ document.querySelectorAll('.make').forEach(b=>b.onclick=async()=>{
+  b.textContent='⬇ 가져오는 중…'; b.disabled=true;
+  const r=await fetch('/api/digg_grab',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({url:b.dataset.url})}).then(r=>r.json());
+  b.textContent = r.ok ? '✓ '+r.date+' 폴더로' : '✗ 실패'; if(r.ok) b.style.background='#1a9e4b';
+}); }
+async function load(){
+  const r=await fetch('/api/digg?cat='+encodeURIComponent(CAT)).then(r=>r.json());
+  const s=r.stats;
+  document.getElementById('stats').textContent=`채널 ${s.channels} · 영상 ${nf(s.total)} · 날짜보강 ${s.enriched}`;
+  document.getElementById('chips').innerHTML=['<span class="chip '+(CAT===''?'on':'')+'" data-c="">전체</span>'].concat((s.cats||[]).map(c=>'<span class="chip '+(CAT===c?'on':'')+'" data-c="'+c+'">'+c+'</span>')).join('');
+  document.querySelectorAll('.chip').forEach(ch=>ch.onclick=()=>{ CAT=ch.dataset.c; load(); });
+  render('digg',r.digg); render('surge',r.surge); render('top',r.top);
+  const st=r.state; document.getElementById('prog').textContent = st.running ? `⏳ ${st.msg} (${st.done}/${st.total})` : (st.msg==='완료 ✓'?'✓ 수집 완료':'');
+  if(st.running) setTimeout(load,2500);
+}
+document.getElementById('crawl').onclick=async()=>{
+  await fetch('/api/digg_crawl',{method:'POST'}); document.getElementById('prog').textContent='⏳ 수집 시작…'; setTimeout(load,1500);
+};
+load();
+</script></body></html>'''
+# ════════════════ 도굴 모듈 끝 ════════════════
+
 class H(BaseHTTPRequestHandler):
     def log_message(self, *a): pass
     def _send(self, code, body, ctype="application/json"):
@@ -935,6 +1145,12 @@ class H(BaseHTTPRequestHandler):
             from urllib.parse import parse_qs, urlparse
             q = parse_qs(urlparse(self.path).query)
             return self.serve_video(os.path.join(SRC_ROOT, (q.get("date") or [""])[0], os.path.basename((q.get("file") or [""])[0])))
+        if p == "/digg":
+            return self._send(200, DIGG_HTML, "text/html; charset=utf-8")
+        if p == "/api/digg":
+            from urllib.parse import parse_qs, urlparse
+            q = parse_qs(urlparse(self.path).query)
+            return self._send(200, json.dumps(digg_data((q.get("cat") or [""])[0])))
         return self._send(404, "{}")
     def serve_video(self, path):
         if not (os.path.isfile(path) and path.lower().endswith(".mp4")):
@@ -979,6 +1195,14 @@ class H(BaseHTTPRequestHandler):
                 with open(out, "rb") as f: img = f.read()
                 return self._send(200, img, "image/jpeg")
             return self._send(200, b"", "image/jpeg")
+        if self.path == "/api/digg_crawl":
+            if not DIGG_STATE["running"]:
+                threading.Thread(target=digg_crawl, daemon=True).start()
+            return self._send(200, json.dumps({"ok": True}))
+        if self.path == "/api/digg_grab":
+            n = int(self.headers.get("Content-Length", 0))
+            data = json.loads(self.rfile.read(n) or b"{}")
+            return self._send(200, json.dumps(digg_grab(data.get("url", ""))))
         return self._send(404, "{}")
 
 def main():
