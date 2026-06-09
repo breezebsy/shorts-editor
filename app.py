@@ -643,7 +643,7 @@ init();
 </html>
 '''
 
-VERSION = "2.3"
+VERSION = "2.4"
 STATE = {"running": False, "current": 0, "total": 0, "lines": [], "done": False, "date": ""}
 
 def hexrgb(h):
@@ -1032,13 +1032,69 @@ def digg_grab(url):
     except Exception as e:
         return {"ok": False, "msg": str(e)}
 
-def digg_oneclick(url):
+# ── 설정(BYOK 키) ──
+SETTINGS_FILE = os.path.join(RUN_DIR, "settings.json")
+def load_settings():
+    try:
+        with open(SETTINGS_FILE, encoding="utf-8") as f: return json.load(f)
+    except Exception: return {}
+def save_settings(d):
+    try:
+        with open(SETTINGS_FILE, "w", encoding="utf-8") as f: json.dump(d, f, ensure_ascii=False, indent=2)
+        return True
+    except Exception: return False
+
+def _llm_call(prompt):
+    import urllib.request
+    s = load_settings(); prov = s.get("llm_provider", "gemini")
+    try:
+        if prov == "claude":
+            key = (s.get("claude_key") or "").strip()
+            if not key: return None, "Claude API 키가 설정되지 않음 (⚙ 설정)"
+            body = json.dumps({"model": s.get("claude_model","claude-haiku-4-5-20251001"), "max_tokens": 1024,
+                "messages": [{"role": "user", "content": prompt}]}).encode("utf-8")
+            req = urllib.request.Request("https://api.anthropic.com/v1/messages", data=body,
+                headers={"x-api-key": key, "anthropic-version": "2023-06-01", "content-type": "application/json"})
+            r = json.loads(urllib.request.urlopen(req, timeout=45).read())
+            return r["content"][0]["text"], None
+        else:
+            key = (s.get("gemini_key") or "").strip()
+            if not key: return None, "Gemini API 키가 설정되지 않음 (⚙ 설정)"
+            model = s.get("gemini_model", "gemini-2.0-flash")
+            url = f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent?key={key}"
+            body = json.dumps({"contents": [{"parts": [{"text": prompt}]}]}).encode("utf-8")
+            req = urllib.request.Request(url, data=body, headers={"content-type": "application/json"})
+            r = json.loads(urllib.request.urlopen(req, timeout=45).read())
+            return r["candidates"][0]["content"]["parts"][0]["text"], None
+    except Exception as e:
+        return None, f"{prov} 호출 오류: {e}"
+
+def gen_meta(title):
+    prompt = ("당신은 한국어 유튜브 쇼츠 메타데이터 전문가입니다. 아래 해외 영상 제목을 보고 "
+        "한국 시청자 대상 쇼츠 메타데이터를 만드세요.\n원본 제목: " + (title or "(제목 없음)") +
+        "\n규칙: title은 호기심 자극 28자 이내, desc는 2~3문장, tags는 8~12개(한글+영문 혼합, # 포함, 관련 키워드).\n"
+        '반드시 아래 JSON 형식으로만 출력: {"title":"...","desc":"...","tags":["#...","#..."]}')
+    txt, err = _llm_call(prompt)
+    if err: return {"ok": False, "msg": err}
+    m = re.search(r"\{.*\}", txt or "", re.S)
+    if not m: return {"ok": False, "msg": "LLM 응답 파싱 실패", "raw": (txt or "")[:200]}
+    try:
+        d = json.loads(m.group(0))
+        return {"ok": True, "title": d.get("title", ""), "desc": d.get("desc", ""), "tags": d.get("tags", [])}
+    except Exception as e:
+        return {"ok": False, "msg": f"JSON 파싱 실패: {e}", "raw": (txt or "")[:200]}
+
+def digg_oneclick(url, title=""):
     g = digg_grab(url)
     if not g.get("ok"): return g
     if STATE.get("running"):
         return {"ok": False, "msg": "편집 작업이 이미 진행 중입니다", "date": g["date"]}
     threading.Thread(target=run_job, args=(g["date"], channel_name(), "(원본 소리 사용)", {"evade": True}), kwargs={"only": g["file"]}, daemon=True).start()
-    return {"ok": True, "date": g["date"], "file": g["file"]}
+    res = {"ok": True, "date": g["date"], "file": g["file"]}
+    if (load_settings().get("gemini_key") or load_settings().get("claude_key")):
+        meta = gen_meta(title)
+        if meta.get("ok"): res["meta"] = meta
+    return res
 
 DIGG_HTML = r'''<!DOCTYPE html>
 <html lang="ko"><head><meta charset="UTF-8">
@@ -1076,7 +1132,7 @@ DIGG_HTML = r'''<!DOCTYPE html>
   #prog{ font-size:12.5px; color:var(--blue); }
 </style></head><body><div class="wrap">
 <div class="top"><h1>💀 시체영상 도굴 <span class="g">· 농기계/지식 (월천식)</span></h1>
-  <div class="tabs"><a class="tab" href="/">🎬 대량 편집</a><a class="tab" href="/single">✂ 개별 편집</a><a class="tab active" href="/digg">💀 도굴</a></div>
+  <div class="tabs"><a class="tab" href="/">🎬 대량 편집</a><a class="tab" href="/single">✂ 개별 편집</a><a class="tab active" href="/digg">💀 도굴</a><a class="tab" href="/settings">⚙</a></div>
 </div>
 <div class="bar">
   <button class="btn" id="crawl">📡 수집 갱신</button>
@@ -1089,7 +1145,18 @@ DIGG_HTML = r'''<!DOCTYPE html>
 <h2 style="color:var(--good)">🔥 급상승 <span class="hint">(24h 증가량 · 매일 수집해야 잡힘)</span></h2><div class="grid" id="surge"></div>
 <h2 style="color:var(--blue)">📈 조회수 상위</h2><div class="grid" id="top"></div>
 </div>
+<div id="metaPanel" style="display:none;position:fixed;left:0;right:0;bottom:0;background:#fff;box-shadow:0 -4px 20px rgba(0,0,0,.18);padding:14px 18px;z-index:50">
+  <div style="max-width:760px;margin:0 auto">
+    <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:8px">
+      <b id="metaStatus">📋 생성된 메타데이터</b>
+      <span><button class="btn sm" id="metaCopy">📋 전체 복사</button> <button class="btn ghost sm" id="metaClose">닫기</button></span>
+    </div>
+    <textarea id="metaText" style="width:100%;height:140px;border:1px solid #d2d2d7;border-radius:10px;padding:10px;font-size:13px;font-family:inherit"></textarea>
+  </div>
+</div>
 <script>
+document.getElementById('metaClose').onclick=()=>document.getElementById('metaPanel').style.display='none';
+document.getElementById('metaCopy').onclick=()=>{ const t=document.getElementById('metaText'); t.select(); navigator.clipboard.writeText(t.value); const b=document.getElementById('metaCopy'); b.textContent='✓ 복사됨'; setTimeout(()=>b.textContent='📋 전체 복사',1500); };
 let CAT="";
 const nf=n=>Number(n).toLocaleString();
 function ageL(d){ if(!d) return ""; if(d>=365) return Math.floor(d/365)+"년전"; if(d>=30) return Math.floor(d/30)+"개월전"; return d+"일전"; }
@@ -1103,20 +1170,31 @@ function card(v,rank){
    <div class="m"><div class="t"><a href="${yt}" target="_blank">${(v.title||'').slice(0,70)}</a></div>
    <div class="s"><span class="ch">@${v.handle}</span> · 👁${nf(v.current_views)} ${age} ${flat}</div>
    <div class="act"><a class="btn ghost sm" href="${yt}" target="_blank">유튜브</a>
+   <button class="btn ghost sm meta" data-title="${(v.title||'').replace(/"/g,'&quot;').slice(0,140)}">📋 제목·태그</button>
    <button class="btn ghost sm make" data-url="${yt}">⬇ 다운만</button>
-   <button class="btn sm one" data-url="${yt}">⚡ 원클릭 양산</button></div></div></div>`;
+   <button class="btn sm one" data-url="${yt}" data-title="${(v.title||'').replace(/"/g,'&quot;').slice(0,140)}">⚡ 원클릭</button></div></div></div>`;
 }
 function render(id,arr){ document.getElementById(id).innerHTML = arr.length ? arr.map((v,i)=>card(v,i+1)).join("") : '<p class="empty">데이터가 없어요. "📡 수집 갱신"을 누르세요.</p>'; bind(); }
+function fmtMeta(m){ return `${m.title}\n\n${m.desc}\n\n${(m.tags||[]).join(' ')}`; }
+function showMeta(text,status){ document.getElementById('metaText').value=text; document.getElementById('metaStatus').textContent=status||'📋 생성된 메타데이터'; document.getElementById('metaPanel').style.display='block'; }
 function bind(){
   document.querySelectorAll('.make').forEach(b=>b.onclick=async()=>{
     b.textContent='⬇ 가져오는 중…'; b.disabled=true;
     const r=await fetch('/api/digg_grab',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({url:b.dataset.url})}).then(r=>r.json());
     b.textContent = r.ok ? '✓ '+r.date+' 폴더로' : '✗ 실패'; if(r.ok) b.style.background='#1a9e4b';
   });
+  document.querySelectorAll('.meta').forEach(b=>b.onclick=async()=>{
+    const o=b.textContent; b.textContent='🤖 생성 중…'; b.disabled=true;
+    const r=await fetch('/api/gen_meta',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({title:b.dataset.title})}).then(r=>r.json());
+    b.disabled=false; b.textContent=o;
+    if(r.ok) showMeta(fmtMeta(r),'📋 제목·태그 (복사해서 업로드)');
+    else showMeta((r.msg||'실패')+(r.raw?'\n\n'+r.raw:''),'⚠ 생성 실패 — ⚙ 설정에서 API 키 확인');
+  });
   document.querySelectorAll('.one').forEach(b=>b.onclick=async()=>{
     b.textContent='⬇ 다운로드 중…'; b.disabled=true;
-    const r=await fetch('/api/digg_oneclick',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({url:b.dataset.url})}).then(r=>r.json());
+    const r=await fetch('/api/digg_oneclick',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({url:b.dataset.url,title:b.dataset.title})}).then(r=>r.json());
     if(!r.ok){ b.textContent='✗ '+(r.msg||'실패'); return; }
+    if(r.meta) showMeta(fmtMeta(r.meta),'📋 제목·태그 (편집 진행 중 · 복사 가능)');
     b.textContent='✂ 편집 시작…';
     let started=false;
     const poll=async()=>{
@@ -1140,6 +1218,69 @@ async function load(){
 }
 document.getElementById('crawl').onclick=async()=>{
   await fetch('/api/digg_crawl',{method:'POST'}); document.getElementById('prog').textContent='⏳ 수집 시작…'; setTimeout(load,1500);
+};
+load();
+</script></body></html>'''
+SETTINGS_HTML = r'''<!DOCTYPE html>
+<html lang="ko"><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>⚙ 설정</title><style>
+  :root{ --blue:#0071e3; --ink:#1d1d1f; --sub:#6e6e73; --bg:#f5f5f7; }
+  *{ box-sizing:border-box; margin:0; padding:0; }
+  body{ font-family:-apple-system,"Apple SD Gothic Neo","Malgun Gothic",sans-serif; background:var(--bg); color:var(--ink); padding:28px 22px; }
+  .wrap{ max-width:640px; margin:0 auto; }
+  .top{ display:flex; align-items:center; justify-content:space-between; flex-wrap:wrap; gap:12px; margin-bottom:18px; }
+  h1{ font-size:22px; font-weight:700; letter-spacing:-.5px; }
+  .tabs{ display:inline-flex; background:#e8e8ed; border-radius:13px; padding:4px; gap:3px; }
+  .tab{ padding:9px 18px; border-radius:10px; font-size:14px; font-weight:600; color:#5f5f66; text-decoration:none; }
+  .tab.active{ background:#fff; color:var(--ink); box-shadow:0 1px 4px rgba(0,0,0,.14); }
+  .card{ background:#fff; border-radius:16px; padding:22px; box-shadow:0 2px 12px rgba(0,0,0,.05); margin-bottom:16px; }
+  h2{ font-size:16px; margin-bottom:14px; }
+  label{ display:block; font-size:13px; color:var(--sub); margin:14px 0 6px; font-weight:600; }
+  input[type=text],input[type=password],select{ width:100%; padding:11px 13px; border:1px solid #d2d2d7; border-radius:11px; font-size:14px; background:#fff; }
+  .prov{ display:flex; gap:10px; margin-top:6px; }
+  .prov label{ flex:1; margin:0; padding:12px; border:2px solid #e3e3e8; border-radius:12px; text-align:center; cursor:pointer; font-weight:700; color:var(--ink); }
+  .prov input{ display:none; }
+  .prov input:checked+span{ color:var(--blue); }
+  .prov label.on{ border-color:var(--blue); background:#f0f7ff; }
+  .hint{ font-size:12px; color:var(--sub); margin-top:5px; line-height:1.5; }
+  .hint a{ color:var(--blue); }
+  .saved{ font-size:12px; color:#1a9e4b; margin-left:8px; }
+  .btn{ background:var(--blue); color:#fff; border:none; padding:12px 22px; border-radius:12px; font-size:15px; font-weight:700; cursor:pointer; margin-top:20px; }
+</style></head><body><div class="wrap">
+<div class="top"><h1>⚙ 설정</h1>
+  <div class="tabs"><a class="tab" href="/digg">💀 도굴</a><a class="tab" href="/">🎬 대량 편집</a><a class="tab active" href="/settings">⚙ 설정</a></div>
+</div>
+<div class="card">
+  <h2>🤖 제목·해시태그 생성 LLM (BYOK)</h2>
+  <label>사용할 AI</label>
+  <div class="prov" id="prov">
+    <label data-p="gemini"><input type="radio" name="prov" value="gemini"><span>Gemini (무료)</span></label>
+    <label data-p="claude"><input type="radio" name="prov" value="claude"><span>Claude</span></label>
+  </div>
+  <label>Gemini API 키 <span class="saved" id="g_saved"></span></label>
+  <input type="password" id="gemini_key" placeholder="비워두면 기존 키 유지">
+  <div class="hint">무료 키 발급: <a href="https://aistudio.google.com/apikey" target="_blank">aistudio.google.com/apikey</a> (비용 0, 분당 제한 있음)</div>
+  <label>Claude API 키 <span class="saved" id="c_saved"></span></label>
+  <input type="password" id="claude_key" placeholder="비워두면 기존 키 유지">
+  <div class="hint">발급: <a href="https://console.anthropic.com/" target="_blank">console.anthropic.com</a> (유료)</div>
+  <button class="btn" id="save">저장</button> <span class="saved" id="msg"></span>
+</div>
+</div>
+<script>
+async function load(){
+  const s=await fetch('/api/settings').then(r=>r.json());
+  document.querySelector(`input[value="${s.llm_provider}"]`).checked=true;
+  paint(); document.getElementById('g_saved').textContent=s.has_gemini?'✓ 저장됨':'';
+  document.getElementById('c_saved').textContent=s.has_claude?'✓ 저장됨':'';
+}
+function paint(){ document.querySelectorAll('#prov label').forEach(l=>l.classList.toggle('on', l.querySelector('input').checked)); }
+document.getElementById('prov').onclick=()=>setTimeout(paint,0);
+document.getElementById('save').onclick=async()=>{
+  const body={ llm_provider:document.querySelector('input[name=prov]:checked').value,
+    gemini_key:document.getElementById('gemini_key').value, claude_key:document.getElementById('claude_key').value };
+  const r=await fetch('/api/settings',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body)}).then(r=>r.json());
+  document.getElementById('msg').textContent=r.ok?'✓ 저장 완료':'✗ 실패';
+  document.getElementById('gemini_key').value=''; document.getElementById('claude_key').value=''; setTimeout(load,300);
 };
 load();
 </script></body></html>'''
@@ -1198,6 +1339,14 @@ class H(BaseHTTPRequestHandler):
             from urllib.parse import parse_qs, urlparse
             q = parse_qs(urlparse(self.path).query)
             return self._send(200, json.dumps(digg_data((q.get("cat") or [""])[0])))
+        if p == "/settings":
+            return self._send(200, SETTINGS_HTML, "text/html; charset=utf-8")
+        if p == "/api/settings":
+            s = load_settings()
+            return self._send(200, json.dumps({"llm_provider": s.get("llm_provider", "gemini"),
+                "has_gemini": bool(s.get("gemini_key")), "has_claude": bool(s.get("claude_key")),
+                "gemini_model": s.get("gemini_model", "gemini-2.0-flash"),
+                "claude_model": s.get("claude_model", "claude-haiku-4-5-20251001")}))
         return self._send(404, "{}")
     def serve_video(self, path):
         if not (os.path.isfile(path) and path.lower().endswith(".mp4")):
@@ -1253,7 +1402,20 @@ class H(BaseHTTPRequestHandler):
         if self.path == "/api/digg_oneclick":
             n = int(self.headers.get("Content-Length", 0))
             data = json.loads(self.rfile.read(n) or b"{}")
-            return self._send(200, json.dumps(digg_oneclick(data.get("url", ""))))
+            return self._send(200, json.dumps(digg_oneclick(data.get("url", ""), data.get("title", ""))))
+        if self.path == "/api/gen_meta":
+            n = int(self.headers.get("Content-Length", 0))
+            data = json.loads(self.rfile.read(n) or b"{}")
+            return self._send(200, json.dumps(gen_meta(data.get("title", ""))))
+        if self.path == "/api/settings":
+            n = int(self.headers.get("Content-Length", 0))
+            data = json.loads(self.rfile.read(n) or b"{}")
+            cur = load_settings()
+            cur["llm_provider"] = data.get("llm_provider", cur.get("llm_provider", "gemini"))
+            for k in ("gemini_key", "claude_key", "gemini_model", "claude_model"):
+                v = (data.get(k) or "").strip()
+                if v: cur[k] = v
+            return self._send(200, json.dumps({"ok": save_settings(cur)}))
         return self._send(404, "{}")
 
 def main():
