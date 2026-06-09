@@ -238,6 +238,7 @@ DASHBOARD_HTML = r'''<!DOCTYPE html>
       <a class="tab active" href="/">🎬 대량 편집</a>
       <a class="tab" href="/single">✂ 개별 편집</a>
       <a class="tab" href="/digg">💀 도굴</a>
+      <a class="tab" href="/settings">⚙ 설정</a>
     </div>
     <div style="display:flex;gap:10px;align-items:center">
       <div class="pill"><span class="dot"></span><span id="ver">v2.0</span> · 자동업데이트 켜짐</div>
@@ -468,6 +469,7 @@ SINGLE_HTML = r'''<!DOCTYPE html>
       <a class="tab" href="/">🎬 대량 편집</a>
       <a class="tab active" href="/single">✂ 개별 편집</a>
       <a class="tab" href="/digg">💀 도굴</a>
+      <a class="tab" href="/settings">⚙ 설정</a>
     </div>
   </div>
   <div class="grid">
@@ -1132,7 +1134,7 @@ DIGG_HTML = r'''<!DOCTYPE html>
   #prog{ font-size:12.5px; color:var(--blue); }
 </style></head><body><div class="wrap">
 <div class="top"><h1>💀 시체영상 도굴 <span class="g">· 농기계/지식 (월천식)</span></h1>
-  <div class="tabs"><a class="tab" href="/">🎬 대량 편집</a><a class="tab" href="/single">✂ 개별 편집</a><a class="tab active" href="/digg">💀 도굴</a><a class="tab" href="/settings">⚙</a></div>
+  <div class="tabs"><a class="tab" href="/">🎬 대량 편집</a><a class="tab" href="/single">✂ 개별 편집</a><a class="tab active" href="/digg">💀 도굴</a><a class="tab" href="/settings">⚙ 설정</a></div>
 </div>
 <div class="bar">
   <button class="btn" id="crawl">📡 수집 갱신</button>
@@ -1248,7 +1250,7 @@ SETTINGS_HTML = r'''<!DOCTYPE html>
   .btn{ background:var(--blue); color:#fff; border:none; padding:12px 22px; border-radius:12px; font-size:15px; font-weight:700; cursor:pointer; margin-top:20px; }
 </style></head><body><div class="wrap">
 <div class="top"><h1>⚙ 설정</h1>
-  <div class="tabs"><a class="tab" href="/digg">💀 도굴</a><a class="tab" href="/">🎬 대량 편집</a><a class="tab active" href="/settings">⚙ 설정</a></div>
+  <div class="tabs"><a class="tab" href="/">🎬 대량 편집</a><a class="tab" href="/single">✂ 개별 편집</a><a class="tab" href="/digg">💀 도굴</a><a class="tab active" href="/settings">⚙ 설정</a></div>
 </div>
 <div class="card">
   <h2>🤖 제목·해시태그 생성 LLM (BYOK)</h2>
