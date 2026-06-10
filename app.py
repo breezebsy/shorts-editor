@@ -286,6 +286,7 @@ DASHBOARD_HTML = r'''<!DOCTYPE html>
         <div class="sw" data-k="mask">마스크 블러<div class="tg"></div></div>
       </div>
       <div class="srow"><span>확대</span><input type="range" min="100" max="200" value="113" id="z"><div class="val" id="zv">113%</div></div>
+      <div class="srow"><span>세로 위치</span><input type="range" min="0" max="100" value="50" id="zypos"><div class="val" id="zyposv">중앙</div></div>
       <div class="srow"><span>속도</span><input type="range" min="100" max="150" value="108" id="s"><div class="val" id="sv">1.08×</div></div>
       <div style="display:flex; gap:28px; margin-top:16px; flex-wrap:wrap; align-items:flex-start">
         <div>
@@ -315,12 +316,16 @@ DASHBOARD_HTML = r'''<!DOCTYPE html>
     <div class="go">
       <button class="btn" id="run">▶  편집 시작</button>
       <button class="btn sec" id="prev">👁 미리보기</button>
+      <button class="btn sec" id="playsrc">🎬 원본 재생</button>
       <button class="btn sec" id="open">결과 폴더 열기</button>
     </div>
 
     <div class="card full">
       <div class="lab" id="ptit">진행 상황</div>
-      <img id="previmg" style="display:none;width:300px;border-radius:14px;margin-bottom:12px;box-shadow:0 2px 12px rgba(0,0,0,.18)">
+      <div style="display:flex;gap:12px;flex-wrap:wrap;align-items:flex-start">
+        <img id="previmg" style="display:none;width:300px;border-radius:14px;margin-bottom:12px;box-shadow:0 2px 12px rgba(0,0,0,.18)">
+        <video id="prevvid" controls playsinline style="display:none;width:300px;border-radius:14px;margin-bottom:12px;box-shadow:0 2px 12px rgba(0,0,0,.18);background:#000"></video>
+      </div>
       <div class="bar"><i id="pbar"></i></div>
       <div class="log" id="log">대기 중…</div>
     </div>
@@ -344,6 +349,9 @@ $('#date').onchange=async()=>{ const r=await fetch('/api/count?date='+encodeURIC
 document.querySelectorAll('#sw .sw').forEach(el=>el.onclick=()=>el.classList.toggle('on'));
 z.oninput=()=>zv.textContent=z.value+'%';
 s.oninput=()=>sv.textContent=(s.value/100).toFixed(2)+'×';
+function zyLabel(v){ return v<34?'위쪽':(v>66?'아래쪽':'중앙'); }
+zypos.oninput=()=>{ pos.y=zypos.value/100; zyposv.textContent=zyLabel(+zypos.value);
+  document.querySelectorAll('#pos .pos').forEach(p=>p.classList.remove('on')); };
 cz.oninput=()=>czv.textContent=cz.value;
 capx.oninput=()=>capxv.textContent=capx.value+'%';
 capy.oninput=()=>capyv.textContent=capy.value+'%';
@@ -360,6 +368,7 @@ document.querySelectorAll('#pos .pos').forEach(el=>{
     document.querySelectorAll('#pos .pos').forEach(p=>p.classList.remove('on'));
     el.classList.add('on'); pos={x:+el.dataset.x, y:+el.dataset.y};
     document.querySelector('#posname').textContent=POSNAME[el.dataset.x+','+el.dataset.y];
+    zypos.value=pos.y*100; zyposv.textContent=zyLabel(pos.y*100);
   };
 });
 function opts(){ const o={zoom:+z.value, speed:+s.value, zx:pos.x, zy:pos.y,
@@ -393,6 +402,14 @@ $('#prev').onclick=async()=>{
     else alert('미리보기 실패 (영상이 없는지 확인)');
   }catch(e){ alert('미리보기 오류'); }
   b.textContent='👁 미리보기'; b.disabled=false;
+};
+$('#playsrc').onclick=async()=>{
+  const date=$('#date').value;
+  const r=await fetch('/api/files?date='+encodeURIComponent(date)).then(r=>r.json());
+  if(!r.files||!r.files.length){ alert('이 날짜 폴더에 원본 영상이 없어요'); return; }
+  const v=$('#prevvid'); $('#previmg').style.display='none';
+  v.src='/video?date='+encodeURIComponent(date)+'&file='+encodeURIComponent(r.files[0]);
+  v.style.display='block'; v.play().catch(()=>{});
 };
 $('#open').onclick=()=>fetch('/api/open');
 $('#quit').onclick=(e)=>{ e.preventDefault();
@@ -523,6 +540,7 @@ SINGLE_HTML = r'''<!DOCTYPE html>
         <div class="sw" data-k="mask">마스크블러<div class="tg"></div></div>
       </div>
       <div class="srow"><span>확대</span><input type="range" min="100" max="200" value="113" id="z"><div class="val" id="zv">113%</div></div>
+      <div class="srow"><span>세로 위치</span><input type="range" min="0" max="100" value="50" id="zypos"><div class="val" id="zyposv">중앙</div></div>
       <div class="srow"><span>속도</span><input type="range" min="100" max="150" value="108" id="s"><div class="val" id="sv">1.08×</div></div>
       <div style="display:flex; gap:20px; margin-top:12px; flex-wrap:wrap; align-items:flex-start">
         <div>
@@ -541,8 +559,12 @@ SINGLE_HTML = r'''<!DOCTYPE html>
           <div class="srow"><span>높이</span><input type="range" min="60" max="600" value="190" id="maskh"><div class="val" id="maskhv">190</div></div>
         </div>
       </div>
-      <button class="btn full" id="prev" style="margin-top:14px;background:var(--bg);color:var(--blue);box-shadow:none">👁 미리보기</button>
+      <div style="display:flex;gap:10px;margin-top:14px">
+        <button class="btn full" id="prev" style="background:var(--bg);color:var(--blue);box-shadow:none">👁 미리보기</button>
+        <button class="btn full" id="playsrc" style="background:var(--bg);color:var(--blue);box-shadow:none">🎬 원본 재생</button>
+      </div>
       <img id="previmg" style="display:none;width:280px;border-radius:12px;margin-top:10px;box-shadow:0 2px 12px rgba(0,0,0,.18)">
+      <video id="prevvid" controls playsinline style="display:none;width:280px;border-radius:12px;margin-top:10px;box-shadow:0 2px 12px rgba(0,0,0,.18);background:#000"></video>
       <button class="btn full" id="make" style="margin-top:12px">✓ 이 구성으로 만들기</button>
       <div class="msg" id="msg"></div>
     </div>
@@ -600,6 +622,9 @@ $('#autosplit').onclick=()=>{
 };
 z.oninput=()=>zv.textContent=z.value+'%';
 s.oninput=()=>sv.textContent=(s.value/100).toFixed(2)+'×';
+function zyLabel(v){ return v<34?'위쪽':(v>66?'아래쪽':'중앙'); }
+zypos.oninput=()=>{ pos.y=zypos.value/100; zyposv.textContent=zyLabel(+zypos.value);
+  document.querySelectorAll('#pos .pos').forEach(p=>p.classList.remove('on')); };
 cz.oninput=()=>czv.textContent=cz.value;
 capx.oninput=()=>capxv.textContent=capx.value+'%';
 capy.oninput=()=>capyv.textContent=capy.value+'%';
@@ -612,7 +637,7 @@ document.querySelectorAll('#sw .sw').forEach(el=>el.onclick=()=>el.classList.tog
 let pos={x:0.5,y:0.5};
 const POSNAME={'0,0':'좌상단','0.5,0':'상단','1,0':'우상단','0,0.5':'좌측','0.5,0.5':'중앙','1,0.5':'우측','0,1':'좌하단','0.5,1':'하단','1,1':'우하단'};
 document.querySelectorAll('#pos .pos').forEach(el=>{ el.title=POSNAME[el.dataset.x+','+el.dataset.y];
-  el.onclick=()=>{ document.querySelectorAll('#pos .pos').forEach(p=>p.classList.remove('on')); el.classList.add('on'); pos={x:+el.dataset.x,y:+el.dataset.y}; $('#posname').textContent=POSNAME[el.dataset.x+','+el.dataset.y]; }; });
+  el.onclick=()=>{ document.querySelectorAll('#pos .pos').forEach(p=>p.classList.remove('on')); el.classList.add('on'); pos={x:+el.dataset.x,y:+el.dataset.y}; $('#posname').textContent=POSNAME[el.dataset.x+','+el.dataset.y]; zypos.value=pos.y*100; zyposv.textContent=zyLabel(pos.y*100); }; });
 function opts(){ const o={zoom:+z.value, speed:+s.value, zx:pos.x, zy:pos.y,
     cap_size:+cz.value, cap_color:ccol.value, cap_bold:cbold.classList.contains('on'), cap_x:capx.value/100, cap_y:capy.value/100,
     template:$('#tpl').value, sfx:$('#sfx').value, desc:$('#desc').value};
@@ -631,6 +656,12 @@ $('#prev').onclick=async()=>{
   }catch(e){ alert('미리보기 오류'); }
   b.textContent='👁 미리보기'; b.disabled=false;
 };
+$('#playsrc').onclick=()=>{
+  if(!$('#file').value){ alert('영상을 먼저 선택하세요'); return; }
+  const v=$('#prevvid'); $('#previmg').style.display='none';
+  v.src='/video?date='+encodeURIComponent($('#date').value)+'&file='+encodeURIComponent($('#file').value);
+  v.style.display='block'; v.play().catch(()=>{});
+};
 $('#make').onclick=async()=>{
   if(!segs.length){ alert('구간을 1개 이상 추가하세요.'); return; }
   $('#make').disabled=true; $('#msg').textContent='만드는 중…';
@@ -645,7 +676,7 @@ init();
 </html>
 '''
 
-VERSION = "2.8"
+VERSION = "2.9"
 STATE = {"running": False, "current": 0, "total": 0, "lines": [], "done": False, "date": ""}
 
 def hexrgb(h):
