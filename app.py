@@ -253,6 +253,7 @@ DASHBOARD_HTML = r'''<!DOCTYPE html>
       <div class="lab" style="margin-top:8px" id="cnt">영상 0개</div>
       <div class="lab" style="margin-top:14px">템플릿 (인스타 프레임)</div>
       <select id="tpl"></select>
+      <div class="srow" style="margin-top:8px"><span>가림 줄이기</span><input type="range" min="0" max="80" value="0" id="tplshrink"><div class="val" id="tplshrinkv">0%</div></div>
     </div>
     <div class="card">
       <div class="lab">채널명 자막</div>
@@ -349,6 +350,7 @@ $('#date').onchange=async()=>{ const r=await fetch('/api/count?date='+encodeURIC
 document.querySelectorAll('#sw .sw').forEach(el=>el.onclick=()=>el.classList.toggle('on'));
 z.oninput=()=>zv.textContent=z.value+'%';
 s.oninput=()=>sv.textContent=(s.value/100).toFixed(2)+'×';
+tplshrink.oninput=()=>tplshrinkv.textContent=tplshrink.value+'%';
 function zyLabel(v){ return v<34?'위쪽':(v>66?'아래쪽':'중앙'); }
 zypos.oninput=()=>{ pos.y=zypos.value/100; zyposv.textContent=zyLabel(+zypos.value);
   document.querySelectorAll('#pos .pos').forEach(p=>p.classList.remove('on')); };
@@ -373,7 +375,7 @@ document.querySelectorAll('#pos .pos').forEach(el=>{
 });
 function opts(){ const o={zoom:+z.value, speed:+s.value, zx:pos.x, zy:pos.y,
     cap_size:+cz.value, cap_color:ccol.value, cap_bold:cbold.classList.contains('on'), cap_x:capx.value/100, cap_y:capy.value/100,
-    template:tpl.value, sfx:$('#sfx').value, desc:$('#desc').value};
+    template:tpl.value, tpl_shrink:+tplshrink.value, sfx:$('#sfx').value, desc:$('#desc').value};
   document.querySelectorAll('#sw .sw').forEach(el=>o[el.dataset.k]=el.classList.contains('on'));
   o.mask_px=maskx.value/100; o.mask_py=masky.value/100; o.mask_w=+maskw.value; o.mask_h=+maskh.value;
   return o; }
@@ -515,6 +517,7 @@ SINGLE_HTML = r'''<!DOCTYPE html>
       <div id="segs"></div>
       <div class="lab" style="margin-top:16px">템플릿</div>
       <select id="tpl"></select>
+      <div class="srow" style="margin-top:8px"><span>가림 줄이기</span><input type="range" min="0" max="80" value="0" id="tplshrink"><div class="val" id="tplshrinkv">0%</div></div>
       <div class="lab" style="margin-top:12px">채널명 자막</div>
       <input type="text" id="ch" value="">
       <div class="srow" style="margin-top:10px"><span>크기</span><input type="range" min="40" max="120" value="74" id="cz"><div class="val" id="czv">74</div></div>
@@ -622,6 +625,7 @@ $('#autosplit').onclick=()=>{
 };
 z.oninput=()=>zv.textContent=z.value+'%';
 s.oninput=()=>sv.textContent=(s.value/100).toFixed(2)+'×';
+tplshrink.oninput=()=>tplshrinkv.textContent=tplshrink.value+'%';
 function zyLabel(v){ return v<34?'위쪽':(v>66?'아래쪽':'중앙'); }
 zypos.oninput=()=>{ pos.y=zypos.value/100; zyposv.textContent=zyLabel(+zypos.value);
   document.querySelectorAll('#pos .pos').forEach(p=>p.classList.remove('on')); };
@@ -640,7 +644,7 @@ document.querySelectorAll('#pos .pos').forEach(el=>{ el.title=POSNAME[el.dataset
   el.onclick=()=>{ document.querySelectorAll('#pos .pos').forEach(p=>p.classList.remove('on')); el.classList.add('on'); pos={x:+el.dataset.x,y:+el.dataset.y}; $('#posname').textContent=POSNAME[el.dataset.x+','+el.dataset.y]; zypos.value=pos.y*100; zyposv.textContent=zyLabel(pos.y*100); }; });
 function opts(){ const o={zoom:+z.value, speed:+s.value, zx:pos.x, zy:pos.y,
     cap_size:+cz.value, cap_color:ccol.value, cap_bold:cbold.classList.contains('on'), cap_x:capx.value/100, cap_y:capy.value/100,
-    template:$('#tpl').value, sfx:$('#sfx').value, desc:$('#desc').value};
+    template:$('#tpl').value, tpl_shrink:+tplshrink.value, sfx:$('#sfx').value, desc:$('#desc').value};
   document.querySelectorAll('#sw .sw').forEach(el=>o[el.dataset.k]=el.classList.contains('on'));
   o.mask_px=maskx.value/100; o.mask_py=masky.value/100; o.mask_w=+maskw.value; o.mask_h=+maskh.value;
   return o; }
@@ -676,7 +680,7 @@ init();
 </html>
 '''
 
-VERSION = "3.0"
+VERSION = "3.1"
 STATE = {"running": False, "current": 0, "total": 0, "lines": [], "done": False, "date": ""}
 
 def hexrgb(h):
@@ -725,6 +729,34 @@ def template_list():
     out = ["(템플릿 없음)"]
     out += [os.path.basename(p) for p in sorted(glob.glob(os.path.join(d, "*.png")))]
     return out
+
+def shrink_template(path, reduce):
+    """위아래 가림 띠를 (1-reduce)배로 세로 압축 → 영상 창을 키움. reduce 0~0.8.
+    원본은 그대로 두고 임시 PNG를 만들어 반환(영상 덜 가리기)."""
+    try:
+        if reduce <= 0: return path
+        im = Image.open(path).convert("RGBA"); W, H = im.size
+        win = template_window(path)
+        if not win: return path
+        x0, y0, ww, wh = win; y1 = y0 + wh
+        nt = max(0, int(y0 * (1 - reduce)))          # 새 상단 띠 높이
+        nb = max(0, int((H - y1) * (1 - reduce)))     # 새 하단 띠 높이
+        nmid = H - nt - nb                            # 창(영상영역)은 나머지 전부
+        out = Image.new("RGBA", (W, H), (0, 0, 0, 0))
+        if nt > 0: out.paste(im.crop((0, 0, W, y0)).resize((W, nt)), (0, 0))
+        out.paste(im.crop((0, y0, W, y1)).resize((W, nmid)), (0, nt))
+        if nb > 0: out.paste(im.crop((0, y1, W, H)).resize((W, nb)), (0, nt + nmid))
+        tmp = os.path.join(tempfile.gettempdir(), f"tpl_shrink_{int(reduce*100)}.png")
+        out.save(tmp); return tmp
+    except Exception:
+        return path
+
+def resolve_template(tpl_path, opts):
+    """템플릿 경로 + '가림 줄이기' 옵션 적용 → (사용할 경로, 영상창 좌표)."""
+    if not tpl_path: return None, None
+    reduce = max(0, min(80, int(opts.get("tpl_shrink", 0)))) / 100.0
+    p = shrink_template(tpl_path, reduce) if reduce > 0 else tpl_path
+    return p, template_window(p)
 
 def mask_region(opts):
     mw = min(1080, max(60, int(opts.get("mask_w", 720))))
@@ -791,7 +823,7 @@ def edit_one(src, dst, cap_png, bgm, opts, tpl_path=None, start=None, seg=None, 
     spd = (int(opts.get("speed", 108)) / 100.0)
     if eff > 12 and spd < 1.2: spd = 1.25
     if opts.get("evade", False): spd = round(spd * random.uniform(0.99, 1.02), 3)
-    tpl_win = template_window(tpl_path) if tpl_path else None
+    tpl_path, tpl_win = resolve_template(tpl_path, opts)
     vf = build_vf(opts, spd, tpl_win)
     cmd = [FFMPEG, "-y"]
     if start is not None and seg:
@@ -921,7 +953,7 @@ def do_preview(data):
         if tname and not str(tname).startswith("("):
             tp = os.path.join(BASE, "템플릿", tname)
             if os.path.exists(tp): tpl_path = tp
-        tpl_win = template_window(tpl_path) if tpl_path else None
+        tpl_path, tpl_win = resolve_template(tpl_path, opts)
         tmp = tempfile.mkdtemp(); cap = os.path.join(tmp, "cap.png")
         make_caption_png(channel or "내채널", cap, size=int(opts.get("cap_size", 74)),
             color=hexrgb(opts.get("cap_color", "#ffffff")), bold=bool(opts.get("cap_bold", False)), desc=opts.get("desc", ""))
