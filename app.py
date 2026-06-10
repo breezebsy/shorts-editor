@@ -417,6 +417,7 @@ $('#open').onclick=()=>fetch('/api/open');
 $('#quit').onclick=(e)=>{ e.preventDefault();
   if(confirm('프로그램을 종료할까요?')){ fetch('/api/shutdown').catch(()=>{});
     document.body.innerHTML='<div style="padding:80px;text-align:center;font-size:18px;color:#888">프로그램이 종료되었습니다.<br>이 브라우저 탭은 닫으셔도 됩니다.</div>'; } };
+setInterval(()=>fetch('/api/ping').catch(()=>{}),2500);  // 창 닫으면 신호 끊겨 자동 종료
 load();
 </script>
 </body>
@@ -674,13 +675,14 @@ $('#make').onclick=async()=>{
   $('#make').disabled=false;
   $('#msg').innerHTML = r.ok ? `<b>완료!</b> 편집완료/${$('#date').value}/개별/ → ${r.out} (${r.parts}구간)` : '실패: '+(r.msg||'');
 };
+setInterval(()=>fetch('/api/ping').catch(()=>{}),2500);  // 창 닫으면 신호 끊겨 자동 종료
 init();
 </script>
 </body>
 </html>
 '''
 
-VERSION = "3.1"
+VERSION = "3.2"
 STATE = {"running": False, "current": 0, "total": 0, "lines": [], "done": False, "date": ""}
 
 def hexrgb(h):
@@ -1589,6 +1591,7 @@ document.getElementById('vslogin').onclick=async()=>{
   const poll=async()=>{ const s=await fetch('/api/vschart_login_state').then(r=>r.json()); prog.textContent='📊 '+(s.msg||''); if(s.login_running) setTimeout(poll,2000); };
   setTimeout(poll,1000);
 };
+setInterval(()=>fetch('/api/ping').catch(()=>{}),2500);  // 창 닫으면 신호 끊겨 자동 종료
 load();
 </script></body></html>'''
 SETTINGS_HTML = r'''<!DOCTYPE html>
@@ -1652,6 +1655,7 @@ document.getElementById('save').onclick=async()=>{
   document.getElementById('msg').textContent=r.ok?'✓ 저장 완료':'✗ 실패';
   document.getElementById('gemini_key').value=''; document.getElementById('claude_key').value=''; setTimeout(load,300);
 };
+setInterval(()=>fetch('/api/ping').catch(()=>{}),2500);  // 창 닫으면 신호 끊겨 자동 종료
 load();
 </script></body></html>'''
 # ════════════════ 도굴 모듈 끝 ════════════════
@@ -1672,6 +1676,9 @@ class H(BaseHTTPRequestHandler):
             return self._send(200, json.dumps({
                 "version": VERSION, "dates": dfs, "latest": d, "count": count_videos(d),
                 "channel": channel_name(), "bgms": bgm_list(), "templates": template_list(), "sfx": sfx_list()}))
+        if p == "/api/ping":
+            HEARTBEAT["t"] = time.time(); HEARTBEAT["seen"] = True
+            return self._send(200, json.dumps({"ok": True}))
         if p == "/api/progress":
             return self._send(200, json.dumps(STATE))
         if p == "/api/count":
@@ -1798,12 +1805,23 @@ class H(BaseHTTPRequestHandler):
             return self._send(200, json.dumps({"ok": save_settings(cur)}))
         return self._send(404, "{}")
 
+HEARTBEAT = {"t": 0.0, "seen": False}  # 브라우저 생존 신호. 끊기면 자동 종료
+def _watchdog():
+    # 브라우저가 /api/ping을 보내다가 8초간 끊기면(창 닫힘) 프로그램 종료.
+    # 작업 중(편집/크롤/로그인)에는 종료하지 않는다.
+    while True:
+        time.sleep(3)
+        busy = STATE.get("running") or DIGG_STATE.get("running") or VSCHART_STATE.get("login_running")
+        if HEARTBEAT["seen"] and not busy and (time.time() - HEARTBEAT["t"] > 8):
+            os._exit(0)
+
 def main():
     ensure_dirs()
     port = 8799
     srv = ThreadingHTTPServer(("127.0.0.1", port), H)
     url = f"http://127.0.0.1:{port}/"
     print(f"쇼츠 자동편집 대시보드 실행 중 → {url}")
+    threading.Thread(target=_watchdog, daemon=True).start()
     try: webbrowser.open(url)
     except Exception: pass
     srv.serve_forever()
