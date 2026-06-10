@@ -645,7 +645,7 @@ init();
 </html>
 '''
 
-VERSION = "2.7"
+VERSION = "2.8"
 STATE = {"running": False, "current": 0, "total": 0, "lines": [], "done": False, "date": ""}
 
 def hexrgb(h):
@@ -1148,23 +1148,79 @@ def _llm_vision(prompt, img_b64):
 VSCHART_PROFILE = os.path.join(os.path.expanduser("~"), ".shortseditor_vsprofile")  # ViewStats 로그인 세션 (드라이브 동기화 회피)
 VSCHART_STATE = {"login_running": False, "msg": ""}
 
+def _vs_ctx(p, headless=True, h=1400):
+    """구글 OAuth 차단 우회: 진짜 크롬 채널 + 자동화 흔적 제거. 크롬 없으면 내장 chromium."""
+    kw = dict(headless=headless, viewport={"width": 1200, "height": h},
+              args=["--disable-blink-features=AutomationControlled"],
+              ignore_default_args=["--enable-automation"])
+    try:
+        return p.chromium.launch_persistent_context(VSCHART_PROFILE, channel="chrome", **kw)
+    except Exception:
+        return p.chromium.launch_persistent_context(VSCHART_PROFILE, **kw)
+
 def _vs_login_worker():
     VSCHART_STATE.update(login_running=True, msg="브라우저에서 ViewStats에 로그인하세요…")
     try:
         from playwright.sync_api import sync_playwright
         with sync_playwright() as p:
-            ctx = p.chromium.launch_persistent_context(VSCHART_PROFILE, headless=False, viewport={"width": 1200, "height": 900})
+            ctx = _vs_ctx(p, headless=False, h=900)
             pg = ctx.pages[0] if ctx.pages else ctx.new_page()
             pg.goto("https://www.viewstats.com/login", timeout=60000)
-            try: pg.wait_for_function("!location.pathname.includes('login') && !location.pathname.includes('signup')", timeout=240000)
-            except Exception: pass
-            pg.wait_for_timeout(1500)
+            # 구글 OAuth 도중(타 도메인)을 완료로 오인하지 않도록, 로그인된 ViewStats 화면을 폴링으로 확인
+            for _ in range(300):  # 2초 × 300 = 최대 10분
+                time.sleep(2)
+                try:
+                    page = ctx.pages[0] if ctx.pages else pg
+                    url = page.url
+                    if "viewstats.com" not in url or "/login" in url or "/signup" in url: continue
+                    head = page.inner_text("header") if page.locator("header").count() else page.inner_text("body")[:300]
+                    if "Log In" in head or "Sign Up" in head: continue
+                    break
+                except Exception:
+                    continue
+            time.sleep(3)
             ctx.close()
         VSCHART_STATE["msg"] = "로그인 세션 저장 완료 ✓"
     except Exception as e:
         VSCHART_STATE["msg"] = f"로그인 오류: {e}"
     finally:
         VSCHART_STATE["login_running"] = False
+
+def viewstats_numbers(handle, video_id, current_views):
+    """ViewStats 일별 조회수 표를 숫자로 직접 추출 → 최근 30일 성장률로 누움 판정 (차트 판독 불필요)."""
+    try:
+        from playwright.sync_api import sync_playwright
+    except Exception:
+        return None
+    text = ""
+    for attempt in range(2):  # 일시적 로드 실패 대비 1회 재시도
+        try:
+            with sync_playwright() as p:
+                ctx = _vs_ctx(p, headless=True)
+                pg = ctx.pages[0] if ctx.pages else ctx.new_page()
+                pg.goto(f"https://www.viewstats.com/@{handle}/videos/{video_id}", timeout=40000)
+                pg.wait_for_timeout(5000)
+                pg.mouse.wheel(0, 1400); pg.wait_for_timeout(2500)
+                text = pg.inner_text("body")
+                ctx.close()
+            if "30 Day Averages" in text or "Unlock video stats" in text: break
+        except Exception:
+            time.sleep(2)
+    if not text:
+        return None
+    if "Unlock video stats" in text or "log in or sign up" in text:
+        return {"need_login": True}
+    rows = re.findall(r"(\d{2}/\d{2}/\d{4})\n+([\d,]+)", text)
+    m30 = re.search(r"30 Day Averages\n+([\d,]+)", text)
+    if not (m30 and current_views): return None
+    sum30 = int(m30.group(1).replace(",", ""))
+    monthly = sum30 / current_views if current_views else 0.0
+    flat = monthly < 0.01  # 최근 30일 증가가 총조회의 1% 미만 = 누움
+    daily = [(d, int(v.replace(",", ""))) for d, v in rows[-14:]]
+    return {"ok": True, "table": True, "sum30": sum30, "current_views": current_views,
+            "monthly_pct": round(monthly * 100, 3), "daily": daily,
+            "verdict": {"flat": flat, "months_flat": 1 if flat else 0, "confidence": 0.95,
+                        "reason": f"ViewStats 실측: 최근 30일 +{sum30:,}회 / 총 {current_views:,}회 (월 {monthly*100:.3f}%)"}}
 
 def wayback_history(video_id, current_views):
     """웹아카이브(Wayback)에서 과거 시점 조회수를 실측 → 수개월 성장률로 누움 판정.
@@ -1207,9 +1263,15 @@ def wayback_history(video_id, current_views):
                         "reason": f"웹아카이브 실측: {ts[:4]}.{ts[4:6]} {past:,}회 → 현재 {current_views:,}회 (+{growth*100:.1f}%, 월 {monthly*100:.2f}%)"}}
 
 def verify_flatline(handle, video_id, current_views=0):
-    # 1차: 웹아카이브 실측 (무료·로그인 불필요·수개월 이력) → 실패 시 ViewStats 차트로 폴백
+    # 1차: 웹아카이브 실측 (무료·로그인 불필요·수개월 이력)
     wb = wayback_history(video_id, int(current_views or 0))
     if wb: return wb
+    # 2차: ViewStats 일별 표 숫자 추출 (로그인 세션 필요, 최근 30일 실측)
+    vs = viewstats_numbers(handle, video_id, int(current_views or 0))
+    if vs and vs.get("ok"): return vs
+    if vs and vs.get("need_login"):
+        return {"ok": False, "msg": "웹아카이브에 기록이 없는 영상이라 ViewStats 확인이 필요한데 로그인이 안 돼 있어요 — 상단 '📊 ViewStats 로그인'을 먼저 해주세요."}
+    # 3차: ViewStats 차트 스크린샷 + AI 판독 (최후 폴백)
     try:
         from playwright.sync_api import sync_playwright
     except Exception:
@@ -1367,6 +1429,11 @@ function bind(){
     if(r.wayback){ const v=r.verdict||{};
       showMeta(`${v.flat?'💀 누움(시체) 판정 — 재업로드 안전권':'📈 아직 성장 중 — 도굴 보류 권장'}\n\n웹아카이브 ${r.snapshot_date} 시점: ${nf(r.past_views)}회\n현재: ${nf(r.current_views)}회\n${r.days}일간 +${r.growth_pct}% (월평균 ${r.monthly_pct}%)\n\n판정 기준: 월평균 성장률 1% 미만 = 누움`,
         v.flat?'💀 누움 검증 — 웹아카이브 실측':'📈 누움 검증 — 웹아카이브 실측');
+      b.textContent = v.flat?'💀 누움 확인':'📈 성장 중'; return; }
+    if(r.table){ const v=r.verdict||{};
+      const days=(r.daily||[]).map(d=>`${d[0]}  +${nf(d[1])}`).join('\n');
+      showMeta(`${v.flat?'💀 누움(시체) 판정 — 재업로드 안전권':'📈 아직 성장 중 — 도굴 보류 권장'}\n\n최근 30일 증가: +${nf(r.sum30)}회 / 총 ${nf(r.current_views)}회 (월 ${r.monthly_pct}%)\n\n[일별 증가 — ViewStats 실측]\n${days}\n\n판정 기준: 최근 30일 증가가 총조회의 1% 미만 = 누움`,
+        v.flat?'💀 누움 검증 — ViewStats 일별 실측':'📈 누움 검증 — ViewStats 일별 실측');
       b.textContent = v.flat?'💀 누움 확인':'📈 성장 중'; return; }
     if(r.need_login){ showChart(r.img,'⚠ 차트가 로그인 게이트입니다 — 상단 "📊 ViewStats 로그인"을 먼저 하세요.',r.url,'📊 로그인 필요'); return; }
     let vh='';
