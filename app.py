@@ -676,7 +676,7 @@ init();
 </html>
 '''
 
-VERSION = "2.9"
+VERSION = "3.0"
 STATE = {"running": False, "current": 0, "total": 0, "lines": [], "done": False, "date": ""}
 
 def hexrgb(h):
@@ -1189,69 +1189,108 @@ def _vs_ctx(p, headless=True, h=1400):
     except Exception:
         return p.chromium.launch_persistent_context(VSCHART_PROFILE, **kw)
 
+# ── 시스템 파이썬 위임 ──
+# exe(PyInstaller)는 자체 파이썬을 쓰므로 그 안엔 playwright가 없다.
+# bat이 깐 playwright는 '시스템 파이썬'에 있으니, ViewStats 작업은 시스템 파이썬에 위임해 실행한다.
+def _system_python():
+    import shutil
+    if not FROZEN:
+        return [sys.executable]  # 맥/개발: 현재 파이썬이 곧 시스템 파이썬
+    for cand in (["py", "-3"], ["python"], ["python3"]):
+        if shutil.which(cand[0]):
+            return cand
+    return None
+
+VS_HELPER_CODE = r'''
+import sys, os, json, time, re
+from playwright.sync_api import sync_playwright
+PROFILE = os.path.join(os.path.expanduser("~"), ".shortseditor_vsprofile")
+def ctx(p, headless=True, h=1400):
+    kw = dict(headless=headless, viewport={"width":1200,"height":h},
+              args=["--disable-blink-features=AutomationControlled"],
+              ignore_default_args=["--enable-automation"])
+    try: return p.chromium.launch_persistent_context(PROFILE, channel="chrome", **kw)
+    except Exception: return p.chromium.launch_persistent_context(PROFILE, **kw)
+cmd = sys.argv[1] if len(sys.argv) > 1 else ""
+if cmd == "login":
+    with sync_playwright() as p:
+        c = ctx(p, headless=False, h=900); pg = c.pages[0] if c.pages else c.new_page()
+        pg.goto("https://www.viewstats.com/login", timeout=60000)
+        for _ in range(300):
+            time.sleep(2)
+            try:
+                page = c.pages[0] if c.pages else pg; u = page.url
+                if "viewstats.com" not in u or "/login" in u or "/signup" in u: continue
+                head = page.inner_text("header") if page.locator("header").count() else page.inner_text("body")[:300]
+                if "Log In" in head or "Sign Up" in head: continue
+                break
+            except Exception: continue
+        time.sleep(3); c.close()
+    print(json.dumps({"ok": True}))
+elif cmd == "check":
+    handle, vid, views = sys.argv[2], sys.argv[3], int(sys.argv[4])
+    text = ""
+    for _ in range(2):
+        try:
+            with sync_playwright() as p:
+                c = ctx(p, headless=True); pg = c.pages[0] if c.pages else c.new_page()
+                pg.goto("https://www.viewstats.com/@%s/videos/%s" % (handle, vid), timeout=40000)
+                pg.wait_for_timeout(5000); pg.mouse.wheel(0, 1400); pg.wait_for_timeout(2500)
+                text = pg.inner_text("body"); c.close()
+            if "30 Day Averages" in text or "Unlock video stats" in text: break
+        except Exception: time.sleep(2)
+    if "Unlock video stats" in text or "log in or sign up" in text:
+        print(json.dumps({"need_login": True})); sys.exit()
+    m = re.search(r"30 Day Averages\n+([\d,]+)", text)
+    if not (m and views): print(json.dumps({"ok": False})); sys.exit()
+    s30 = int(m.group(1).replace(",", "")); monthly = s30 / views
+    rows = re.findall(r"(\d{2}/\d{2}/\d{4})\n+([\d,]+)", text)
+    daily = [[d, int(v.replace(",", ""))] for d, v in rows[-14:]]
+    flat = monthly < 0.01
+    print(json.dumps({"ok": True, "table": True, "sum30": s30, "current_views": views,
+        "monthly_pct": round(monthly*100, 3), "daily": daily,
+        "verdict": {"flat": flat, "months_flat": 1 if flat else 0, "confidence": 0.95,
+        "reason": "ViewStats 실측: 최근 30일 +%s회 / 총 %s회 (월 %.3f%%)" % (format(s30,","), format(views,","), monthly*100)}},
+        ensure_ascii=False))
+'''
+
+def _run_vs_helper(args, timeout=130):
+    """시스템 파이썬으로 VS_HELPER_CODE를 실행하고 마지막 JSON 라인을 파싱."""
+    py = _system_python()
+    if not py:
+        return {"error": "no_python", "msg": "윈도우에 파이썬이 없어요 — '1_빌드' 안내대로 파이썬을 먼저 설치하세요."}
+    tmp = os.path.join(tempfile.gettempdir(), "vs_helper.py")
+    try:
+        with open(tmp, "w", encoding="utf-8") as f: f.write(VS_HELPER_CODE)
+        r = subprocess.run(py + [tmp] + [str(a) for a in args],
+                           capture_output=True, text=True, timeout=timeout)
+        lines = [l for l in r.stdout.splitlines() if l.strip().startswith("{")]
+        if lines:
+            return json.loads(lines[-1])
+        err = (r.stderr or "")[-300:]
+        if "No module named 'playwright'" in err or "ModuleNotFoundError" in err:
+            return {"error": "no_playwright", "msg": "'2_누움검증_설치(선택).bat'을 먼저 실행해 주세요 (playwright 설치)."}
+        return {"error": "no_output", "msg": err or "출력 없음"}
+    except subprocess.TimeoutExpired:
+        return {"error": "timeout", "msg": "시간 초과"}
+    except Exception as e:
+        return {"error": "exc", "msg": str(e)}
+
 def _vs_login_worker():
     VSCHART_STATE.update(login_running=True, msg="브라우저에서 ViewStats에 로그인하세요…")
     try:
-        from playwright.sync_api import sync_playwright
-        with sync_playwright() as p:
-            ctx = _vs_ctx(p, headless=False, h=900)
-            pg = ctx.pages[0] if ctx.pages else ctx.new_page()
-            pg.goto("https://www.viewstats.com/login", timeout=60000)
-            # 구글 OAuth 도중(타 도메인)을 완료로 오인하지 않도록, 로그인된 ViewStats 화면을 폴링으로 확인
-            for _ in range(300):  # 2초 × 300 = 최대 10분
-                time.sleep(2)
-                try:
-                    page = ctx.pages[0] if ctx.pages else pg
-                    url = page.url
-                    if "viewstats.com" not in url or "/login" in url or "/signup" in url: continue
-                    head = page.inner_text("header") if page.locator("header").count() else page.inner_text("body")[:300]
-                    if "Log In" in head or "Sign Up" in head: continue
-                    break
-                except Exception:
-                    continue
-            time.sleep(3)
-            ctx.close()
-        VSCHART_STATE["msg"] = "로그인 세션 저장 완료 ✓"
-    except Exception as e:
-        VSCHART_STATE["msg"] = f"로그인 오류: {e}"
+        r = _run_vs_helper(["login"], timeout=660)
+        VSCHART_STATE["msg"] = "로그인 세션 저장 완료 ✓" if r.get("ok") else f"로그인 오류: {r.get('msg', r.get('error','실패'))}"
     finally:
         VSCHART_STATE["login_running"] = False
 
 def viewstats_numbers(handle, video_id, current_views):
-    """ViewStats 일별 조회수 표를 숫자로 직접 추출 → 최근 30일 성장률로 누움 판정 (차트 판독 불필요)."""
-    try:
-        from playwright.sync_api import sync_playwright
-    except Exception:
-        return None
-    text = ""
-    for attempt in range(2):  # 일시적 로드 실패 대비 1회 재시도
-        try:
-            with sync_playwright() as p:
-                ctx = _vs_ctx(p, headless=True)
-                pg = ctx.pages[0] if ctx.pages else ctx.new_page()
-                pg.goto(f"https://www.viewstats.com/@{handle}/videos/{video_id}", timeout=40000)
-                pg.wait_for_timeout(5000)
-                pg.mouse.wheel(0, 1400); pg.wait_for_timeout(2500)
-                text = pg.inner_text("body")
-                ctx.close()
-            if "30 Day Averages" in text or "Unlock video stats" in text: break
-        except Exception:
-            time.sleep(2)
-    if not text:
-        return None
-    if "Unlock video stats" in text or "log in or sign up" in text:
-        return {"need_login": True}
-    rows = re.findall(r"(\d{2}/\d{2}/\d{4})\n+([\d,]+)", text)
-    m30 = re.search(r"30 Day Averages\n+([\d,]+)", text)
-    if not (m30 and current_views): return None
-    sum30 = int(m30.group(1).replace(",", ""))
-    monthly = sum30 / current_views if current_views else 0.0
-    flat = monthly < 0.01  # 최근 30일 증가가 총조회의 1% 미만 = 누움
-    daily = [(d, int(v.replace(",", ""))) for d, v in rows[-14:]]
-    return {"ok": True, "table": True, "sum30": sum30, "current_views": current_views,
-            "monthly_pct": round(monthly * 100, 3), "daily": daily,
-            "verdict": {"flat": flat, "months_flat": 1 if flat else 0, "confidence": 0.95,
-                        "reason": f"ViewStats 실측: 최근 30일 +{sum30:,}회 / 총 {current_views:,}회 (월 {monthly*100:.3f}%)"}}
+    """ViewStats 일별 조회수 표를 시스템 파이썬(playwright)으로 추출 → 최근 30일 성장률 누움 판정."""
+    r = _run_vs_helper(["check", handle, video_id, int(current_views or 0)], timeout=130)
+    if r.get("need_login"): return {"need_login": True}
+    if r.get("ok"): return r
+    if r.get("error") in ("no_playwright", "no_python"): return {"need_install": r.get("msg")}
+    return None
 
 def wayback_history(video_id, current_views):
     """웹아카이브(Wayback)에서 과거 시점 조회수를 실측 → 수개월 성장률로 누움 판정.
@@ -1302,6 +1341,8 @@ def verify_flatline(handle, video_id, current_views=0):
     if vs and vs.get("ok"): return vs
     if vs and vs.get("need_login"):
         return {"ok": False, "msg": "웹아카이브에 기록이 없는 영상이라 ViewStats 확인이 필요한데 로그인이 안 돼 있어요 — 상단 '📊 ViewStats 로그인'을 먼저 해주세요."}
+    if vs and vs.get("need_install"):
+        return {"ok": False, "msg": vs.get("need_install")}
     # 3차: ViewStats 차트 스크린샷 + AI 판독 (최후 폴백)
     try:
         from playwright.sync_api import sync_playwright
